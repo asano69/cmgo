@@ -50,7 +50,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Printf("cmgo: accept: %v", err)
 		return
 	}
-	defer conn.CloseNow()
+	defer func() { _ = conn.CloseNow() }()
 	conn.SetReadLimit(1 << 20)
 
 	ctx, cancel := context.WithCancel(r.Context())
