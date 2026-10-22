@@ -1,15 +1,15 @@
-// Package collab is a reusable server for @codemirror/collab. It keeps the
+// Package cmgo is a reusable server for @codemirror/collab. It keeps the
 // ordered list of accepted updates of one document, applies them to the text,
 // relays them to every connected client and relays remote cursors.
 //
 // Typical use:
 //
-//	mux.Handle("/connection/collab", collab.New())
+//	mux.Handle("/connection/collab", cmgo.New())
 //
 // Serve several documents with several Servers. To authenticate connections,
 // wrap the Server in an http.Handler. Use WithTracker to follow the edits
 // (for example to keep metadata per line) and WithAuthor to tell who made them.
-package collab
+package cmgo
 
 import (
 	"encoding/json"
@@ -130,7 +130,7 @@ func (s *Server) Replace(text string) {
 	updates := []Update{{ClientID: serverID, Changes: changes}}
 	if err := s.apply(updates, nil); err != nil {
 		// Unreachable: replaceChanges only returns changes that fit s.doc.
-		log.Printf("collab: replace: %v", err)
+		log.Printf("cmgo: replace: %v", err)
 		return
 	}
 	s.accept(updates)
@@ -159,7 +159,7 @@ func encode(from int, updates []Update) []byte {
 	data, err := json.Marshal(updatesMessage{Type: "updates", From: from, Updates: updates})
 	if err != nil {
 		// Unreachable: every Update was already parsed from valid JSON.
-		log.Printf("collab: encode: %v", err)
+		log.Printf("cmgo: encode: %v", err)
 		return nil
 	}
 	return data

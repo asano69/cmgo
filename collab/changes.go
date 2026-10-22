@@ -1,4 +1,4 @@
-package collab
+package cmgo
 
 import (
 	"encoding/json"

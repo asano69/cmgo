@@ -1,4 +1,4 @@
-package collab
+package cmgo
 
 import (
 	"context"
@@ -47,7 +47,7 @@ func (s *Server) readLoop(ctx context.Context, conn *websocket.Conn, c *client) 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Accept(w, r, nil)
 	if err != nil {
-		log.Printf("collab: accept: %v", err)
+		log.Printf("cmgo: accept: %v", err)
 		return
 	}
 	defer conn.CloseNow()
