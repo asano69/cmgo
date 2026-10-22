@@ -1,4 +1,4 @@
-package cmgo
+package collab
 
 import (
 	"context"

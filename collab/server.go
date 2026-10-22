@@ -1,15 +1,15 @@
-// Package cmgo is a reusable server for @codemirror/collab. It keeps the
+// Package collab is a reusable server for @codemirror/collab. It keeps the
 // ordered list of accepted updates of one document, applies them to the text,
 // relays them to every connected client and relays remote cursors.
 //
 // Typical use:
 //
-//	mux.Handle("/connection/collab", cmgo.New())
+//	mux.Handle("/connection/collab", collab.New())
 //
 // Serve several documents with several Servers. To authenticate connections,
 // wrap the Server in an http.Handler. Use WithTracker to follow the edits
 // (for example to keep metadata per line) and WithAuthor to tell who made them.
-package cmgo
+package collab
 
 import (
 	"encoding/json"
