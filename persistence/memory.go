@@ -7,29 +7,30 @@ import (
 	"sync"
 )
 
-// MemoryStore keeps snapshots in memory. It is safe for concurrent use.
-type MemoryStore struct {
-	mu        sync.Mutex
-	snapshots map[string][]byte
+// MemoryPersistence keeps the state of rooms in memory. It is safe for
+// concurrent use.
+type MemoryPersistence struct {
+	mu     sync.Mutex
+	states map[string][]byte
 }
 
-func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{snapshots: map[string][]byte{}}
+func NewMemoryPersistence() *MemoryPersistence {
+	return &MemoryPersistence{states: map[string][]byte{}}
 }
 
-func (s *MemoryStore) LoadSnapshot(_ context.Context, docID string) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	data, ok := s.snapshots[docID]
+func (m *MemoryPersistence) Load(_ context.Context, room string) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	state, ok := m.states[room]
 	if !ok {
-		return nil, fmt.Errorf("%w: %q", ErrNotFound, docID)
+		return nil, fmt.Errorf("%w: %q", ErrRoomNotFound, room)
 	}
-	return slices.Clone(data), nil
+	return slices.Clone(state), nil
 }
 
-func (s *MemoryStore) SaveSnapshot(_ context.Context, docID string, snapshot []byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.snapshots[docID] = slices.Clone(snapshot)
+func (m *MemoryPersistence) Store(_ context.Context, room string, state []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.states[room] = slices.Clone(state)
 	return nil
 }

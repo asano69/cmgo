@@ -9,7 +9,7 @@ import (
 	"github.com/asano69/cmgo/persistence"
 )
 
-const docID = "data.txt"
+const room = "data.txt"
 
 var ctx = context.Background()
 
@@ -22,9 +22,13 @@ func (d *fakeDoc) Replace(t string) { d.text = t }
 func newSyncer(t *testing.T) (*Syncer, *fakeDoc, string) {
 	t.Helper()
 	dir := t.TempDir()
+	store, err := persistence.NewFilePersistence(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	doc := &fakeDoc{}
-	s := &Syncer{doc: doc, store: persistence.NewFileStore(dir), docID: docID}
-	return s, doc, filepath.Join(dir, docID)
+	s := &Syncer{doc: doc, store: store, room: room}
+	return s, doc, filepath.Join(dir, room)
 }
 
 func writeFile(t *testing.T, path, text string) {
@@ -124,17 +128,17 @@ func TestSyncRestoresDeletedFile(t *testing.T) {
 
 // Any SnapshotStore works, not only files.
 func TestSyncWorksWithAnyStore(t *testing.T) {
-	store := persistence.NewMemoryStore()
+	store := persistence.NewMemoryPersistence()
 	doc := &fakeDoc{text: "buffer"}
-	s := &Syncer{doc: doc, store: store, docID: "doc"}
+	s := &Syncer{doc: doc, store: store, room: "doc"}
 	mustSync(t, s)
 
-	got, err := store.LoadSnapshot(ctx, "doc")
+	got, err := store.Load(ctx, "doc")
 	if err != nil || string(got) != "buffer" {
 		t.Fatalf("stored %q, %v; want %q", got, err, "buffer")
 	}
 
-	if err := store.SaveSnapshot(ctx, "doc", []byte("external")); err != nil {
+	if err := store.Store(ctx, "doc", []byte("external")); err != nil {
 		t.Fatal(err)
 	}
 	mustSync(t, s)

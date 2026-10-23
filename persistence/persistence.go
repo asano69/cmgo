@@ -1,6 +1,7 @@
-// Package persistence defines where document snapshots are stored. A snapshot
-// is the full content of a document at one moment; saving one replaces the
-// previous snapshot of the same document.
+// Package persistence defines where the state of shared documents is stored,
+// keyed by room name as in ygo's persistence package. A store holds the head
+// state of each room, which is the full text of the document. There is no
+// history: storing replaces what was stored before.
 package persistence
 
 import (
@@ -8,25 +9,25 @@ import (
 	"errors"
 )
 
-// ErrNotFound is returned (wrapped) by LoadSnapshot when nothing was saved
-// for the document yet. Test for it with errors.Is.
-var ErrNotFound = errors.New("snapshot not found")
+// ErrRoomNotFound is returned (wrapped) by Load when nothing was stored for
+// the room yet. Test for it with errors.Is.
+var ErrRoomNotFound = errors.New("persistence: room not found")
 
-// SnapshotStore saves and loads the snapshot of a document.
-type SnapshotStore interface {
-	// LoadSnapshot returns the latest snapshot of docID, or an error wrapping
-	// ErrNotFound if there is none.
-	LoadSnapshot(ctx context.Context, docID string) ([]byte, error)
-	// SaveSnapshot replaces the snapshot of docID.
-	SaveSnapshot(ctx context.Context, docID string, snapshot []byte) error
+// Persistence stores the head state of rooms.
+type Persistence interface {
+	// Load returns the stored state of room, or an error wrapping
+	// ErrRoomNotFound if there is none.
+	Load(ctx context.Context, room string) ([]byte, error)
+	// Store replaces the state of room.
+	Store(ctx context.Context, room string, state []byte) error
 }
 
-// Watcher is implemented by stores that can tell when a snapshot was changed
-// by someone else. Consumers that find it on a store use it to react sooner
-// than polling would.
+// Watcher is implemented by stores that can tell when the state of a room was
+// changed by someone else. Consumers that find it on a store use it to react
+// sooner than polling would.
 type Watcher interface {
-	// Watch sends a value whenever the snapshot of docID may have changed. The
+	// Watch sends a value whenever the state of room may have changed. The
 	// channel is closed when ctx is done. Sends never block: values are
 	// dropped while one is already pending.
-	Watch(ctx context.Context, docID string) (<-chan struct{}, error)
+	Watch(ctx context.Context, room string) (<-chan struct{}, error)
 }

@@ -29,8 +29,8 @@ type Document interface {
 // Syncer synchronizes one Document with one snapshot of a store.
 type Syncer struct {
 	doc   Document
-	store persistence.SnapshotStore
-	docID string
+	store persistence.Persistence
+	room string
 
 	// mu serializes sync calls. Lock order: mu, then the document's own lock.
 	mu sync.Mutex
@@ -40,12 +40,12 @@ type Syncer struct {
 	lastSynced string
 }
 
-// Start loads the snapshot docID of store into doc (or creates it from doc),
+// Start loads the state of room from store into doc (or creates it from doc),
 // then keeps both in sync in the background until ctx is done. If the store
-// implements persistence.Watcher, edits of the snapshot are picked up at once;
-// otherwise at the next save interval.
-func Start(ctx context.Context, doc Document, store persistence.SnapshotStore, docID string) error {
-	s := &Syncer{doc: doc, store: store, docID: docID}
+// implements persistence.Watcher, edits of the stored state are picked up at
+// once; otherwise at the next save interval.
+func Start(ctx context.Context, doc Document, store persistence.Persistence, room string) error {
+	s := &Syncer{doc: doc, store: store, room: room}
 	if err := s.sync(ctx); err != nil {
 		return err
 	}
@@ -53,7 +53,7 @@ func Start(ctx context.Context, doc Document, store persistence.SnapshotStore, d
 	var changed <-chan struct{}
 	if w, ok := store.(persistence.Watcher); ok {
 		var err error
-		if changed, err = w.Watch(ctx, docID); err != nil {
+		if changed, err = w.Watch(ctx, room); err != nil {
 			return err
 		}
 	}
@@ -116,8 +116,8 @@ func (s *Syncer) sync(ctx context.Context) error {
 		return nil
 	}
 	// Also reached when the snapshot is missing, which restores it.
-	if err := s.store.SaveSnapshot(ctx, s.docID, []byte(text)); err != nil {
-		return fmt.Errorf("save %s: %w", s.docID, err)
+	if err := s.store.Store(ctx, s.room, []byte(text)); err != nil {
+		return fmt.Errorf("save %s: %w", s.room, err)
 	}
 	s.lastSynced = text
 	return nil
@@ -127,12 +127,12 @@ func (s *Syncer) sync(ctx context.Context) error {
 var lineEndings = strings.NewReplacer("\r\n", "\n", "\r", "\n")
 
 func (s *Syncer) load(ctx context.Context) (text string, exists bool, err error) {
-	data, err := s.store.LoadSnapshot(ctx, s.docID)
-	if errors.Is(err, persistence.ErrNotFound) {
+	data, err := s.store.Load(ctx, s.room)
+	if errors.Is(err, persistence.ErrRoomNotFound) {
 		return "", false, nil
 	}
 	if err != nil {
-		return "", false, fmt.Errorf("load %s: %w", s.docID, err)
+		return "", false, fmt.Errorf("load %s: %w", s.room, err)
 	}
 	return lineEndings.Replace(string(data)), true, nil
 }

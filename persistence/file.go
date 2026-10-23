@@ -12,27 +12,31 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-// FileStore keeps the snapshot of a document in the file dir/docID, so that
+// FilePersistence keeps the state of a room in the file dir/room, so that
 // other programs can read and edit it. It implements Watcher.
-type FileStore struct {
+type FilePersistence struct {
 	dir string
 }
 
-func NewFileStore(dir string) *FileStore {
-	return &FileStore{dir: filepath.Clean(dir)}
-}
-
-// path returns the file of docID. A docID is a plain file name: anything that
-// could leave dir is refused.
-func (s *FileStore) path(docID string) (string, error) {
-	if docID == "" || docID == "." || docID == ".." || filepath.Base(docID) != docID {
-		return "", fmt.Errorf("document ID %q must be a plain file name", docID)
+// NewFilePersistence opens (creating if necessary) a store in the directory dir.
+func NewFilePersistence(dir string) (*FilePersistence, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("create %s: %w", dir, err)
 	}
-	return filepath.Join(s.dir, docID), nil
+	return &FilePersistence{dir: filepath.Clean(dir)}, nil
 }
 
-func (s *FileStore) LoadSnapshot(ctx context.Context, docID string) ([]byte, error) {
-	p, err := s.path(docID)
+// path returns the file of room. A room is a plain file name: anything that
+// could leave dir is refused.
+func (f *FilePersistence) path(room string) (string, error) {
+	if room == "" || room == "." || room == ".." || filepath.Base(room) != room {
+		return "", fmt.Errorf("room %q must be a plain file name", room)
+	}
+	return filepath.Join(f.dir, room), nil
+}
+
+func (f *FilePersistence) Load(ctx context.Context, room string) ([]byte, error) {
+	p, err := f.path(room)
 	if err != nil {
 		return nil, err
 	}
@@ -41,7 +45,7 @@ func (s *FileStore) LoadSnapshot(ctx context.Context, docID string) ([]byte, err
 	}
 	data, err := os.ReadFile(p)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, fmt.Errorf("%w: %s", ErrNotFound, p)
+		return nil, fmt.Errorf("%w: %s", ErrRoomNotFound, p)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", p, err)
@@ -49,22 +53,22 @@ func (s *FileStore) LoadSnapshot(ctx context.Context, docID string) ([]byte, err
 	return data, nil
 }
 
-func (s *FileStore) SaveSnapshot(ctx context.Context, docID string, snapshot []byte) error {
-	p, err := s.path(docID)
+func (f *FilePersistence) Store(ctx context.Context, room string, state []byte) error {
+	p, err := f.path(room)
 	if err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return WriteAtomic(p, snapshot)
+	return WriteAtomic(p, state)
 }
 
-// Watch reports every event on the file of docID. The directory is watched,
+// Watch reports every event on the file of room. The directory is watched,
 // not the file: editors that save by renaming and WriteAtomic replace the
 // file, which ends a file watch.
-func (s *FileStore) Watch(ctx context.Context, docID string) (<-chan struct{}, error) {
-	p, err := s.path(docID)
+func (f *FilePersistence) Watch(ctx context.Context, room string) (<-chan struct{}, error) {
+	p, err := f.path(room)
 	if err != nil {
 		return nil, err
 	}
@@ -72,9 +76,9 @@ func (s *FileStore) Watch(ctx context.Context, docID string) (<-chan struct{}, e
 	if err != nil {
 		return nil, fmt.Errorf("watch %s: %w", p, err)
 	}
-	if err := w.Add(s.dir); err != nil {
+	if err := w.Add(f.dir); err != nil {
 		w.Close()
-		return nil, fmt.Errorf("watch %s: %w", s.dir, err)
+		return nil, fmt.Errorf("watch %s: %w", f.dir, err)
 	}
 
 	changed := make(chan struct{}, 1)
