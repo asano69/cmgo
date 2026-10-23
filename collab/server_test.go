@@ -118,6 +118,19 @@ func TestReplaceUpdatesTextAndNotifiesClients(t *testing.T) {
 	}
 }
 
+func TestUpdatesAreEncodedOncePerBatch(t *testing.T) {
+	s := New()
+	a, b := newTestClient(), newTestClient()
+	s.join(a)
+	s.join(b)
+
+	s.Replace("hello")
+	fromA, fromB := <-a.send, <-b.send
+	if &fromA[0] != &fromB[0] {
+		t.Error("the batch was encoded once per client")
+	}
+}
+
 func TestLeaveStopsTheUpdates(t *testing.T) {
 	s := New()
 	c := newTestClient()

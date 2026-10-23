@@ -61,6 +61,27 @@ type Server struct {
 	// held while the Document is called.
 	mu      sync.Mutex
 	clients map[*client]struct{}
+
+	// last is the encoding of the latest batch that was delivered. Subscribers
+	// are called one after the other with the Document locked, so it needs no
+	// lock of its own.
+	last batch
+}
+
+// batch is a run of updates in encoded form.
+type batch struct {
+	from, n int
+	data    []byte
+}
+
+// encodeBatch encodes updates once for all clients: every subscriber is handed
+// the same batch in turn. The history only grows, so a batch with the same
+// start and length always holds the same updates.
+func (s *Server) encodeBatch(from int, updates []authority.Update) []byte {
+	if s.last.data == nil || s.last.from != from || s.last.n != len(updates) {
+		s.last = batch{from: from, n: len(updates), data: encode(from, updates)}
+	}
+	return s.last.data
 }
 
 func New(opts ...Option) *Server {
@@ -95,7 +116,7 @@ func deliver(c *client, data []byte) {
 func (s *Server) join(c *client) {
 	c.unsubscribe = s.Subscribe(func(from int, updates []authority.Update) {
 		if len(updates) > 0 {
-			deliver(c, encode(from, updates))
+			deliver(c, s.encodeBatch(from, updates))
 		}
 		deliver(c, s.tracker.Message())
 	})
