@@ -3,6 +3,8 @@ package collab
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/asano69/cmgo/authority"
 )
 
 func newTestClient() *client {
@@ -16,23 +18,25 @@ type recorder struct {
 	extra   []byte
 }
 
-func (r *recorder) Track(_ []Change, _ []uint16, author any, _ int64) {
+func (r *recorder) Track(_ []authority.Change, _ []uint16, author any, _ int64) {
 	r.calls++
 	r.authors = append(r.authors, author)
 }
 
 func (r *recorder) Message() []byte { return r.extra }
 
+const pushHi = `{"type":"push","version":0,"updates":[{"clientID":"a","changes":[[0,"hi"]]}]}`
+
 func TestPushRejectsInvalidChanges(t *testing.T) {
 	rec := &recorder{}
 	s := New(WithTracker(rec))
-	bad := []Update{{ClientID: "a", Changes: json.RawMessage(`[3]`)}}
+	bad := `{"type":"push","version":0,"updates":[{"clientID":"a","changes":[3]}]}`
 
-	if err := s.push(newTestClient(), pushMessage{Version: 0, Updates: bad}); err == nil {
+	if err := s.handle(newTestClient(), []byte(bad)); err == nil {
 		t.Fatal("expected an error for changes that do not fit the document")
 	}
-	if len(s.updates) != 0 {
-		t.Errorf("invalid update was recorded: %d updates", len(s.updates))
+	if s.Version() != 0 {
+		t.Errorf("invalid update was recorded: version %d", s.Version())
 	}
 	if rec.calls != 0 {
 		t.Errorf("Track was called %d times for an invalid update", rec.calls)
@@ -41,9 +45,7 @@ func TestPushRejectsInvalidChanges(t *testing.T) {
 
 func TestPushAppliesChanges(t *testing.T) {
 	s := New()
-	good := []Update{{ClientID: "a", Changes: json.RawMessage(`[[0,"hi"]]`)}}
-
-	if err := s.push(newTestClient(), pushMessage{Version: 0, Updates: good}); err != nil {
+	if err := s.handle(newTestClient(), []byte(pushHi)); err != nil {
 		t.Fatal(err)
 	}
 	if got := s.Text(); got != "hi" {
@@ -56,13 +58,38 @@ func TestPushTracksAppliedChangesWithTheAuthor(t *testing.T) {
 	s := New(WithTracker(rec))
 	c := newTestClient()
 	c.author = "alice"
-	good := []Update{{ClientID: "a", Changes: json.RawMessage(`[[0,"hi"]]`)}}
 
-	if err := s.push(c, pushMessage{Version: 0, Updates: good}); err != nil {
+	if err := s.handle(c, []byte(pushHi)); err != nil {
 		t.Fatal(err)
 	}
 	if rec.calls != 1 || rec.authors[0] != "alice" {
 		t.Errorf("Track calls = %d, authors = %v; want one call by alice", rec.calls, rec.authors)
+	}
+}
+
+func TestPushSendsMissingUpdatesToAStaleClient(t *testing.T) {
+	s := New()
+	if err := s.handle(newTestClient(), []byte(pushHi)); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := newTestClient()
+	push := `{"type":"push","version":0,"updates":[{"clientID":"b","changes":[[0,"x"]]}]}`
+	if err := s.handle(stale, []byte(push)); err != nil {
+		t.Fatal(err)
+	}
+	if len(stale.send) != 1 {
+		t.Fatalf("stale client got %d messages, want 1", len(stale.send))
+	}
+	var msg updatesMessage
+	if err := json.Unmarshal(<-stale.send, &msg); err != nil {
+		t.Fatal(err)
+	}
+	if msg.Type != "updates" || msg.From != 0 || len(msg.Updates) != 1 {
+		t.Errorf("got %+v, want the first update from index 0", msg)
+	}
+	if got := s.Text(); got != "hi" {
+		t.Errorf("a stale push changed the text: %q", got)
 	}
 }
 
@@ -86,7 +113,19 @@ func TestReplaceUpdatesTextAndNotifiesClients(t *testing.T) {
 	}
 
 	s.Replace("hello")
-	if len(s.updates) != 1 {
-		t.Errorf("replacing with the same text added an update: %d", len(s.updates))
+	if s.Version() != 1 {
+		t.Errorf("replacing with the same text added an update: %d", s.Version())
+	}
+}
+
+func TestLeaveStopsTheUpdates(t *testing.T) {
+	s := New()
+	c := newTestClient()
+	s.join(c)
+	s.leave(c)
+
+	s.Replace("hello")
+	if len(c.send) != 0 {
+		t.Errorf("a client that left got %d messages", len(c.send))
 	}
 }

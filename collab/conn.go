@@ -10,11 +10,12 @@ import (
 
 // client is one connection. id and cursor are guarded by Server.mu.
 type client struct {
-	send   chan []byte
-	cancel context.CancelFunc
-	author any    // who is behind the connection, from WithAuthor
-	id     string // clientID from the latest cursor message
-	cursor []byte // latest cursor message, replayed to new clients
+	send        chan []byte
+	cancel      context.CancelFunc
+	unsubscribe func() // stops the delivery of document updates; set by join
+	author      any    // who is behind the connection, from WithAuthor
+	id          string // clientID from the latest cursor message
+	cursor      []byte // latest cursor message, replayed to new clients
 }
 
 func (c *client) writeLoop(ctx context.Context, conn *websocket.Conn) {
