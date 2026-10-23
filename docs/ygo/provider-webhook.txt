@@ -1,0 +1,213 @@
+package webhook // import "github.com/reearth/ygo/provider/webhook"
+
+Package webhook posts ygo document events to an external HTTP endpoint with
+HMAC-SHA256 request signing, debounce / coalescing of consecutive updates,
+and bounded retry-with-exponential-backoff on transient errors.
+
+Mirrors the Hocuspocus `extension-webhook` integration pattern (#61). Useful for
+forwarding doc events to Slack / Teams, audit logs, downstream AI workflows,
+search index pipelines, no-code platforms, etc.
+
+# Usage
+
+The easiest path is AttachTo, which wires every relevant Server hook
+(OnLoadDocument, OnUnloadDocument, OnFirstPeer, OnLastPeer, and the per-doc
+OnUpdate stream) onto the Webhook in one call:
+
+    wh, _ := webhook.New(webhook.Config{URL: "https://hooks.example.com/ygo"})
+    defer wh.Close(context.Background())
+
+    srv := ygws.NewServer()
+    detach := webhook.AttachTo(srv, wh)
+    defer detach()
+
+For finer control, drive the Webhook directly via Enqueue.
+
+# Signature
+
+Every POST carries an `X-YGo-Signature-256` header of the form `sha256=<hex>`
+where `<hex>` is the HMAC-SHA256 of the request body using Config.Secret as the
+key. Receivers should reject requests whose signature does not match the body —
+defends against forged events when the URL is exposed to the open internet.
+
+CONSTANTS
+
+const (
+
+	// SignatureHeader is the HTTP request header that carries the
+	// HMAC-SHA256 signature of the body when Config.Secret is set.
+	SignatureHeader = "X-YGo-Signature-256"
+)
+
+FUNCTIONS
+
+func AttachTo(srv *ygws.Server, wh *Webhook) func()
+    AttachTo wires every relevant Server lifecycle hook to wh so the webhook
+    receives one Event per significant happening on every room the server hosts:
+
+      - OnLoadDocument → EventLoad (and registers OnUpdate → EventUpdate for
+        that room's doc, so subsequent updates also flow)
+      - OnUnloadDocument → EventUnload
+      - OnFirstPeer → EventConnect (first peer in this active session)
+      - OnLastPeer → EventDisconnect (last peer in this active session)
+
+    AttachTo returns an idempotent detach function that unwires the four hooks.
+    It does NOT unsubscribe per-doc OnUpdate listeners — those stay attached
+    for the lifetime of each doc, which matches Yjs's "listeners outlive types"
+    semantics.
+
+    AttachTo cooperates with any existing OnLoadDocument the caller has already
+    set on srv: it captures the previous value and calls it first, propagating
+    any error. This keeps the helper composable with application-specific load
+    logic. The other three hooks (OnUnload, OnFirstPeer, OnLastPeer) are simple
+    void hooks, so they similarly chain to any pre-existing handler.
+
+    Typical usage:
+
+        srv := ygws.NewServer()
+        wh, _ := webhook.New(webhook.Config{URL: "https://hooks.example.com"})
+        defer wh.Close(context.Background())
+        detach := webhook.AttachTo(srv, wh)
+        defer detach()
+
+    Use AttachTo to satisfy the Hocuspocus `extension-webhook` pattern without
+    writing the boilerplate for each event type (#61).
+
+func DecodeUpdate(b64 string) ([]byte, error)
+    DecodeUpdate is a convenience for receivers: parses the base64-encoded
+    Update field back into raw V1 update bytes. Exists so the on-the-wire shape
+    can stay JSON-friendly without requiring callers to know that json.Unmarshal
+    handles []byte as base64 automatically.
+
+func EncodeBody(e Event) ([]byte, error)
+    EncodeBody is a low-level helper that returns the exact JSON body the
+    Webhook would POST for the given event, including the auto-populated
+    Timestamp. Exported so test code and downstream tooling can verify
+    signatures without spinning up a Webhook.
+
+func VerifySignature(body, secret []byte, sig string) bool
+    VerifySignature checks whether sig (in `sha256=<hex>` form) matches
+    HMAC-SHA256(body, secret). Constant-time comparison. Returns true on match.
+    Receivers wiring a webhook handler should call this on every inbound request
+    before trusting the payload.
+
+
+TYPES
+
+type Config struct {
+	// URL is the destination endpoint. Must be HTTP or HTTPS.
+	URL string
+	// Secret is the HMAC-SHA256 key used to sign every request body.
+	// If empty, no signature header is emitted (suitable only for
+	// trusted internal networks).
+	Secret []byte
+	// Debounce is the window within which consecutive events with the
+	// same (Room, Type) are coalesced into a single delivery carrying
+	// the most-recent event. Zero applies the default (1 * time.Second);
+	// values above 10 * time.Second are capped at the maximum to prevent
+	// runaway buffering. There is no way to disable debounce — Enqueue
+	// is always at least minimally batched.
+	Debounce time.Duration
+	// MaxRetries is the number of delivery attempts before the event
+	// is dropped on transient failure. Zero uses the default (5).
+	// Status codes 200-299 succeed; 5xx and network errors retry with
+	// exponential backoff; 4xx drops immediately (the receiver said no).
+	MaxRetries int
+	// BackoffBase is the first retry delay; each subsequent attempt
+	// doubles the delay. Zero uses the default (250 * time.Millisecond).
+	BackoffBase time.Duration
+	// MaxBackoff caps the per-attempt sleep, defending against very high
+	// MaxRetries producing minute-scale waits. Zero uses the default
+	// (30 * time.Second). Up to ±20% jitter is added on top of the
+	// computed delay to break thundering-herd retry alignment when
+	// many concurrent webhooks fail against the same receiver.
+	MaxBackoff time.Duration
+	// MaxBodyBytes caps the size of a single POST body. Zero uses the
+	// default (16 MiB). Events whose JSON encoding exceeds this size
+	// are dropped with a logged warning.
+	MaxBodyBytes int64
+	// MaxConcurrentDeliveries bounds the number of in-flight POSTs at
+	// any one time. Zero uses the default (8). A burst of pending
+	// events past this cap blocks the dispatch loop until in-flight
+	// deliveries finish — preventing unbounded goroutine creation when
+	// a slow / dead receiver collects a long queue.
+	MaxConcurrentDeliveries int
+	// HTTPClient is the http.Client used for outbound requests. Zero
+	// value uses a default client with a 10-second per-request timeout.
+	HTTPClient *http.Client
+	// Logger receives structured log entries when events are dropped
+	// for size or retry exhaustion. nil falls back to slog.Default().
+	Logger *slog.Logger
+}
+    Config configures a Webhook. URL is required; all other fields have sensible
+    defaults.
+
+type Event struct {
+	// Type identifies what happened.
+	Type EventType `json:"type"`
+	// Room is the room name the event applies to.
+	Room string `json:"room"`
+	// Update is the V1 update bytes for EventUpdate (nil for other types).
+	// Encoded as base64 on the wire.
+	Update []byte `json:"update,omitempty"`
+	// Timestamp is the time the event was enqueued, in RFC3339Nano.
+	// Set automatically by Enqueue; callers should not pre-populate it.
+	Timestamp time.Time `json:"timestamp"`
+}
+    Event is a single ygo event delivered to the webhook URL.
+
+type EventType string
+    EventType is the kind of event delivered by the webhook.
+
+const (
+	// EventUpdate fires for every committed document update. The Update
+	// field carries the V1 update bytes (base64-encoded on the wire).
+	EventUpdate EventType = "update"
+	// EventConnect fires when a peer connects to a room (one event per
+	// peer per room).
+	EventConnect EventType = "connect"
+	// EventDisconnect fires when a peer disconnects from a room.
+	EventDisconnect EventType = "disconnect"
+	// EventLoad fires when a room is loaded into memory (the first peer
+	// joins, or Apply / BroadcastUpdate creates it).
+	EventLoad EventType = "load"
+	// EventUnload fires when a room is evicted from memory (last peer
+	// leaves, or CloseRoom is called).
+	EventUnload EventType = "unload"
+)
+type Webhook struct {
+	// Has unexported fields.
+}
+    Webhook is a running webhook delivery worker. Construct with New, push
+    events with Enqueue, and call Close when done.
+
+    Internally a single dispatcher goroutine owns the pending map and the
+    debounce timer (avoids the Timer.Reset semantics that previously allowed a
+    queued AfterFunc to fire after Close, see #93 self-review C1/C2). Delivery
+    goroutines are bounded by Config.MaxConcurrentDeliveries.
+
+func New(cfg Config) (*Webhook, error)
+    New constructs a Webhook from cfg and starts its dispatcher goroutine.
+    Call Close to release.
+
+    Returns an error if cfg.URL is empty, unparseable, missing a host, or uses a
+    scheme other than http / https. Validating up front means construction fails
+    fast rather than every delivery silently dropping later at request build
+    time.
+
+func (w *Webhook) Close(ctx context.Context) error
+    Close stops accepting new events, fires any pending events synchronously,
+    and waits for in-flight deliveries to finish or for ctx to cancel.
+
+    After Close returns, calls to Enqueue silently drop the event.
+
+func (w *Webhook) Enqueue(e Event)
+    Enqueue submits an event for delivery. Events are coalesced by the pair
+    (Room, Type): two events in the same debounce window with the same room
+    AND same event type collapse to the most-recent one. A Connect followed by
+    an Update for the same room in the same window produces two separate POSTs
+    (one Connect, one Update) — only same- type same-room events get coalesced,
+    so distinct event categories never overwrite each other.
+
+    Enqueue on a closed Webhook silently drops the event.
+

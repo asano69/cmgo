@@ -1,0 +1,110 @@
+package sync // import "github.com/reearth/ygo/sync"
+
+Package sync implements the y-protocols binary sync protocol.
+
+The protocol is transport-agnostic: SyncStep1, SyncStep2, and Update messages
+are plain []byte that can be sent over WebSocket, HTTP, WebRTC, or in-process
+pipes.
+
+Typical two-peer handshake:
+
+    // Peer A sends its state vector
+    step1 := sync.EncodeSyncStep1(docA)
+
+    // Peer B responds with missing updates
+    step2, _ := sync.EncodeSyncStep2(docB, step1)
+
+    // Peer A applies the response
+    sync.ApplySyncMessage(docA, step2)
+
+Reference: https://github.com/yjs/y-protocols/blob/master/PROTOCOL.md
+
+Package sync implements the y-protocols binary sync protocol.
+
+The protocol is transport-agnostic: SyncStep1, SyncStep2, and Update messages
+are plain []byte that can be sent over WebSocket, HTTP, WebRTC, or in-process
+pipes.
+
+Typical two-peer handshake:
+
+    // Peer A sends its state vector
+    step1 := sync.EncodeSyncStep1(docA)
+
+    // Peer B responds with missing updates
+    step2, _ := sync.EncodeSyncStep2(docB, step1)
+
+    // Peer A applies the response
+    sync.ApplySyncMessage(docA, step2)
+
+Reference: https://github.com/yjs/y-protocols/blob/master/PROTOCOL.md
+
+CONSTANTS
+
+const (
+	MsgSyncStep1 = 0
+	MsgSyncStep2 = 1
+	MsgUpdate    = 2
+)
+    Message type constants as defined by y-protocols.
+
+
+VARIABLES
+
+var (
+	ErrUnexpectedEOF  = errors.New("sync: unexpected end of message")
+	ErrUnknownMessage = errors.New("sync: unknown message type")
+)
+
+FUNCTIONS
+
+func ApplySyncMessage(doc *crdt.Doc, msg []byte, origin any, opts ...ApplySyncMessageOption) (reply []byte, err error)
+    ApplySyncMessage decodes a sync message and applies it to doc. It handles
+    all three message types:
+      - step-1: returns a step-2 reply that should be sent back to the sender
+      - step-2: applies the enclosed update; reply is nil
+      - update: applies the enclosed update; reply is nil
+
+    The origin value is passed through to doc.ApplyUpdate and can be used by
+    observers to identify the source of an update (e.g. a connection ID).
+
+    Pass WithErrorHandler to keep a sync loop alive across malformed updates.
+
+func EncodeSyncStep1(doc *crdt.Doc) []byte
+    EncodeSyncStep1 encodes a sync-step-1 message containing doc's state vector.
+    The receiver should respond with EncodeSyncStep2.
+
+func EncodeSyncStep2(doc *crdt.Doc, step1msg []byte) ([]byte, error)
+    EncodeSyncStep2 decodes the state vector from a step-1 message and returns a
+    sync-step-2 message containing the updates the remote peer is missing.
+
+func EncodeUpdate(update []byte) []byte
+    EncodeUpdate wraps a raw V1 update in a sync update message (type 2).
+    Use this to broadcast incremental updates to peers after a local change.
+
+func ReadSyncMessage(msg []byte) (msgType int, payload []byte, err error)
+    ReadSyncMessage parses the header of a sync message and returns the message
+    type constant and raw payload bytes without applying anything to a document.
+    Useful for routing or inspecting messages before deciding how to handle
+    them.
+
+
+TYPES
+
+type ApplySyncMessageOption func(*applySyncOpts)
+    ApplySyncMessageOption configures ApplySyncMessage. Use WithErrorHandler to
+    keep the sync loop alive across a single malformed message.
+
+func WithErrorHandler(fn func(error)) ApplySyncMessageOption
+    WithErrorHandler routes ApplyUpdateV1 errors encountered during sync-step-2
+    or update dispatch to a caller-supplied handler instead of returning them.
+    When set, ApplySyncMessage swallows the apply error after invoking the
+    handler and returns (nil, nil), letting a transport read loop continue
+    processing subsequent messages from the same peer.
+
+    Without this option, ApplySyncMessage preserves the pre-v1.8.2 behavior
+    of returning the error to the caller. Decoding errors (truncated headers,
+    unknown message types) are always returned regardless of this option — only
+    ApplyUpdateV1 errors on a well-framed payload are routed to the handler.
+
+    Matches y-protocols `readSyncMessage(..., errorHandler)` (sync.js).
+

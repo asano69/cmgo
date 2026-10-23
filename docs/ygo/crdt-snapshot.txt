@@ -1,0 +1,225 @@
+    ErrInvalidUpdate is returned when a binary update cannot be decoded.
+
+var ErrSnapshotSourceGCed = errors.New("crdt: cannot reconstruct from a GC-enabled source doc; create it with WithGC(false)")
+    ErrSnapshotSourceGCed is returned by CreateDocFromSnapshot / RestoreDocument
+    when the source doc has garbage collection enabled. A GC-enabled doc
+    replaces the content of deleted items with length-only tombstones at
+    transaction commit (#78 H1), so an item deleted AFTER the snapshot no longer
+    carries the content it had at snapshot time — reconstruction would silently
+    produce a wrong (incomplete) document. Create the source with WithGC(false)
+    to preserve the history a snapshot needs.
+
+var ErrSubdocAlreadyIntegrated = errors.New("ygo/crdt: subdocument already integrated; create a second instance with the same guid")
+    ErrSubdocAlreadyIntegrated is raised when a Doc already embedded as a
+    subdocument is embedded again. Create a second Doc with the same guid
+    instead.
+
+var ErrUnsupportedAttributeValue = fmt.Errorf("ygo/crdt: attribute value outside the lib0 any domain")
+    ErrUnsupportedAttributeValue is returned by NewContentAttribute for values
+--
+func DocContainsUpdateV1(doc *Doc, update []byte) (bool, error)
+    DocContainsUpdateV1 reports whether doc already holds everything the V1
+    update carries, as SnapshotContainsUpdateV1(CaptureSnapshot(doc), update)
+    does, without building a snapshot: update is decoded before doc is locked,
+    doc is held under its read lock only, its structs are compared against
+    doc's clocks, and its deletion ranges are checked against doc's store in one
+    forward pass per client. update is not integrated; one that does not decode
+    returns an error wrapping ErrInvalidUpdate.
+
+func EncodeContentIDs(c ContentIDs) []byte
+    EncodeContentIDs encodes c as inserts then deletes, following yjs-main's
+    writeContentIds composition (src/utils/meta.js): two IdSets concatenated.
+--
+    followed by VarInt(assoc).
+
+func EncodeSnapshot(snap *Snapshot) []byte
+    EncodeSnapshot serialises snap to bytes in the Yjs V1 snapshot format,
+    interoperable with Y.encodeSnapshot / Y.decodeSnapshot.
+
+    Wire layout (matching Yjs encodeSnapshotV2 with a V1 encoder): the delete
+    set FIRST, then the state vector, concatenated into a single stream with
+    NO outer length prefixes — `writeDeleteSet(enc, ds); writeStateVector(enc,
+    sv)`. The previous ygo layout wrote the state vector first, each block
+    wrapped in its own VarBytes length prefix, which no Yjs peer could parse
+    (review finding F-5).
+
+func EncodeStateAsUpdateV1(doc *Doc, sv StateVector) []byte
+    EncodeStateAsUpdateV1 encodes the part of doc newer than sv as a V1 binary
+--
+    Y.applyUpdateV2 / Y.encodeStateAsUpdateV2 from the yjs npm package.
+
+func EncodeStateFromSnapshot(doc *Doc, snap *Snapshot) ([]byte, error)
+    EncodeStateFromSnapshot returns a V1 update representing doc's state at snap
+    time. Apply it to a fresh Doc to reconstruct the historical version.
+
+    Like CreateDocFromSnapshot, doc must have been created WithGC(false):
+    a GC-enabled source may have discarded content the snapshot references, so
+    this returns ErrSnapshotSourceGCed rather than a silently-incomplete export.
+    Do not call it from inside a Transact callback — it takes the doc lock and
+    would deadlock.
+
+func EncodeStateVectorFromUpdate(update []byte) ([]byte, error)
+    EncodeStateVectorFromUpdate extracts the state vector described by a V1
+    update — the next clock per client (max struct end) — without integrating
+    it. Useful for computing what a peer is missing directly from an update.
+    (#57)
+--
+    binary blob (VarUint count, then client/clock pairs).
+
+func EqualSnapshots(a, b *Snapshot) bool
+    EqualSnapshots reports whether a and b represent exactly the same state.
+
+func MergeUpdatesV1(updates ...[]byte) ([]byte, error)
+    MergeUpdatesV1 merges several V1 updates into one. Structs are merged at the
+    struct level (preserving non-integrable structs and clock gaps) and delete
+    sets are unioned — matching Yjs mergeUpdates. (Previously this applied to a
+    temp Doc and re-encoded, silently dropping parked structs; #125.)
+
+func MergeUpdatesV2(updates ...[]byte) ([]byte, error)
+--
+    This is a no-op when doc.gc is false. After RunGC runs, RestoreDocument
+    can no longer reconstruct states that predate the GC'd deletions — take
+    snapshots before calling RunGC if you need to preserve history.
+
+func SnapshotContainsUpdateV1(snap *Snapshot, update []byte) (bool, error)
+    SnapshotContainsUpdateV1 reports whether snap already holds everything the
+    V1 update carries: every struct in update lies below snap's state vector,
+    and every deletion in it is in snap's delete set, so applying update to
+    the document snap was taken from would change nothing. update is decoded
+    without being integrated; one that does not decode returns an error wrapping
+    ErrInvalidUpdate. Matches Yjs snapshotContainsUpdate.
+
+func UpdateV1ToV2(v1 []byte) ([]byte, error)
+    UpdateV1ToV2 converts a V1 update payload to real Yjs V2 format. It works
+    at the struct level, like MergeUpdatesV1, so an incremental or delete-only
+    update converts intact (integrating into a scratch doc parked such updates
+    and emitted an empty one; yjs convertUpdateFormatV1ToV2 parity).
+
+func UpdateV2ToV1(v2 []byte) ([]byte, error)
+--
+    YMap, YText, …) live inside a Doc.
+
+func CreateDocFromSnapshot(src *Doc, snap *Snapshot) (*Doc, error)
+    CreateDocFromSnapshot reconstructs the document state captured by
+    snap into a new, independent Doc — the Go equivalent of Yjs JS's
+    createDocFromSnapshot. Items inserted after the snapshot are excluded,
+    and only deletions present in the snapshot's DeleteSet are applied;
+    a key/element deleted after the snapshot reappears in the reconstruction.
+
+    src must have been created WithGC(false) (the snapshot-history pattern):
+    a GC-enabled source may have discarded the content/tombstones the snapshot
+    references, so reconstruction returns ErrSnapshotSourceGCed rather than
+    a silently-wrong doc. The returned doc is itself non-GC, so it can be
+    snapshotted or restored from again.
+
+    Do not call from inside a Transact callback: it acquires src's lock and
+    would deadlock — resolve the snapshot outside the transaction.
+
+func New(opts ...DocOption) *Doc
+    New creates a new Doc with a randomly generated ClientID.
+
+func RestoreDocument(doc *Doc, snap *Snapshot) (*Doc, error)
+    RestoreDocument creates a new Doc that reflects doc's state at the time
+    snap was taken. Items inserted after the snapshot are excluded, and only
+    deletions present in the snapshot's DeleteSet are applied.
+
+    Retained for backward compatibility; it delegates to CreateDocFromSnapshot
+    (the Yjs-parity name) and shares its GC-safety guard — see
+    ErrSnapshotSourceGCed.
+
+func (d *Doc) ApplyUpdate(update []byte) error
+    ApplyUpdate decodes and integrates a V1 binary update into the document.
+
+func (d *Doc) AutoLoad() bool
+    AutoLoad returns whether this subdocument should be auto-loaded by remote
+    peers.
+
+--
+
+func (d *Doc) PendingStats() PendingStats
+    PendingStats returns a snapshot of the pending-queue state. Cheap; takes
+    a read lock and copies a few values. Intended for operational monitoring
+    of out-of-order delta convergence; see v1.2.0 release notes for the
+    pending-structs machinery this exposes.
+
+func (d *Doc) ShouldLoad() bool
+    ShouldLoad returns whether a provider should sync this doc now.
+
+func (d *Doc) StateVector() StateVector
+--
+      - The document may be modified by another goroutine between the time fn
+        returns and the time observers fire; observers should treat txn as a
+        snapshot of what changed, not a live view of the current state.
+
+    Panic semantics:
+      - If fn panics (or any Phase 1 work panics), d.mu is released via defer.
+      - Observers fire with whatever partial state was committed before the
+        panic: OnUpdate receives a V1 update describing the mutations that
+        completed (non-empty if fn mutated; minimal but well-formed if fn
+        panicked before mutating); per-type, deep, and OnAfterTransaction
+        observers fire for what was recorded in txn.changed.
+--
+    WithGC controls whether deleted item content is freed at the end of
+    each transaction. Default is true. Set to false to preserve history for
+    snapshots.
+
+func WithGUID(guid string) DocOption
+    WithGUID sets the document's subdocument identifier. When a Doc is embedded
+    inside another Doc via ContentDoc, the GUID identifies it across peers.
+
+func WithMaxPendingItems(n int) DocOption
+    WithMaxPendingItems caps the per-doc pending queue depth — items parked
+    waiting for out-of-order dependencies. Once the cap is reached, further
+--
+	MissingFor []ClientID
+}
+    PendingStats is a snapshot of the doc's pending-queue depth. Returned by
+    Doc.PendingStats. Used for observability — operators can monitor queue
+    growth to detect adversarial peers or persistent convergence gaps. The
+    snapshot is immediately stale; do not use as a synchronization primitive.
+
+type RelativePosition struct {
+	// Item is the ID of the item this position is anchored to.
+	// Nil anchors the position to the named root type (Tname) itself, which
+	// resolves to the end of the type when Assoc >= 0 and to the start when
+	// Assoc < 0 (matching Yjs toAbsolutePosition).
+	Item *ID
+
+--
+    so existing in-package call sites are unaffected.
+
+type Snapshot struct {
+	StateVector StateVector
+	DeleteSet   DeleteSet
+}
+    Snapshot captures the state of a Yjs document at a specific moment in time.
+    It records which items existed (StateVector) and which were deleted
+    (DeleteSet) at that moment. Snapshots can be used to restore documents to a
+    past state or to compute what has changed between two points in time.
+
+func CaptureSnapshot(doc *Doc) *Snapshot
+    CaptureSnapshot takes a snapshot of doc's current state.
+
+func DecodeSnapshot(data []byte) (*Snapshot, error)
+    DecodeSnapshot parses bytes produced by EncodeSnapshot (or
+    Y.encodeSnapshot): delete set first, then the state vector, both inline (no
+    length prefixes).
+
+type StackItem struct {
+
+	// Meta holds arbitrary user data attached to this stack item.
+	// Useful for storing cursor positions, selection ranges, etc.
+	// around the undo boundary.
+	Meta map[string]any
+--
+
+func (m *YMap) Entries() map[string]any
+    Entries returns a snapshot of all live key-value pairs. Nested shared
+    types are iteratively unwrapped (#75): nested YArray → []any, nested YMap →
+    map[string]any, nested YText → string. Pre-fix these were silently dropped
+    from the output.
+
+    Must not be called from inside a Transact callback.
+
+func (m *YMap) ForEach(fn func(key string, value any))
+    ForEach calls fn for every live (non-deleted) key-value pair in the map,

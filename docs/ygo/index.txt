@@ -1,0 +1,26 @@
+go list github.com/reearth/ygo/...
+github.com/reearth/ygo/awareness
+github.com/reearth/ygo/benchmarks
+github.com/reearth/ygo/cluster
+github.com/reearth/ygo/cluster/redis
+github.com/reearth/ygo/cmd/ygo-server
+github.com/reearth/ygo/crdt
+github.com/reearth/ygo/crdt/types
+github.com/reearth/ygo/encoding
+github.com/reearth/ygo/examples/collab-editor/server
+github.com/reearth/ygo/examples/http-sync
+github.com/reearth/ygo/examples/offline-client
+github.com/reearth/ygo/examples/peer-sync
+github.com/reearth/ygo/examples/snapshot-history
+github.com/reearth/ygo/internal/relaylane
+github.com/reearth/ygo/internal/roomname
+github.com/reearth/ygo/mobile
+github.com/reearth/ygo/persistence
+github.com/reearth/ygo/persistence/sqlite
+github.com/reearth/ygo/provider/client
+github.com/reearth/ygo/provider/http
+github.com/reearth/ygo/provider/webhook
+github.com/reearth/ygo/provider/websocket
+github.com/reearth/ygo/sync
+github.com/reearth/ygo/testutil
+github.com/reearth/ygo/testutil/fuzz

@@ -1,0 +1,1949 @@
+package crdt // import "github.com/reearth/ygo/crdt"
+
+Package crdt implements the Yjs CRDT algorithm in pure Go.
+
+The central concept is the Item: a node in a per-type doubly-linked list that
+carries content and origin pointers enabling conflict-free merging (YATA).
+
+Start with Doc, which is the root of a collaborative document. Inside a
+transaction, resolve root types through the Transaction (the Doc-level accessors
+take the document lock Transact already holds and would deadlock; see issue
+#138):
+
+    doc := crdt.New()
+    doc.Transact(func(txn *crdt.Transaction) {
+        txn.GetText("content").Insert(txn, 0, "Hello", nil)
+    })
+    update := doc.EncodeStateAsUpdate()
+
+Reference algorithm: https://github.com/yjs/yjs/blob/main/INTERNALS.md
+
+# Quick start
+
+    doc := crdt.New()
+    text := doc.GetText("body")
+    doc.Transact(func(txn *crdt.Transaction) {
+        text.Insert(txn, 0, "hello", nil)
+    })
+    update := crdt.EncodeStateAsUpdateV1(doc, nil)
+
+See the Example* functions for canonical usage patterns.
+
+# Stability
+
+ygo follows semantic versioning. The v1.x public API is considered stable:
+new functionality lands as minor releases; bug fixes as patch releases; breaking
+changes are deferred to v2.
+
+# Origin Tags
+
+The Origin field on Transaction, ChangeEvent (awareness), and
+UndoManager.trackedOrigins uses type any for user-defined tags. Callers must
+type-assert on read. Origin is used for filtering in observers and undo-manager
+scope.
+
+VARIABLES
+
+var ErrAttributionDecode = errors.New("ygo/crdt: malformed attribution data")
+    ErrAttributionDecode wraps every malformed-input error returned by
+    the attribution decoders (DecodeIDSet, DecodeIDMap, DecodeContentIDs,
+    DecodeContentMap).
+
+var ErrInvalidRelativePosition = errors.New("crdt: invalid relative position")
+    ErrInvalidRelativePosition is returned when a RelativePosition cannot be
+    decoded from its binary representation.
+
+var ErrInvalidUTF8 = encoding.ErrInvalidUTF8
+    ErrInvalidUTF8 is crdt's re-export of encoding.ErrInvalidUTF8, for entry
+    points (like NewContentAttribute) whose signature already returns an
+    error rather than panicking. It is the SAME sentinel value as encoding's,
+    not an independent one, so errors.Is matches regardless of which package's
+    name callers compare against.
+
+var ErrInvalidUpdate = errors.New("crdt: invalid update")
+    ErrInvalidUpdate is returned when a binary update cannot be decoded.
+
+var ErrSnapshotSourceGCed = errors.New("crdt: cannot reconstruct from a GC-enabled source doc; create it with WithGC(false)")
+    ErrSnapshotSourceGCed is returned by CreateDocFromSnapshot / RestoreDocument
+    when the source doc has garbage collection enabled. A GC-enabled doc
+    replaces the content of deleted items with length-only tombstones at
+    transaction commit (#78 H1), so an item deleted AFTER the snapshot no longer
+    carries the content it had at snapshot time — reconstruction would silently
+    produce a wrong (incomplete) document. Create the source with WithGC(false)
+    to preserve the history a snapshot needs.
+
+var ErrSubdocAlreadyIntegrated = errors.New("ygo/crdt: subdocument already integrated; create a second instance with the same guid")
+    ErrSubdocAlreadyIntegrated is raised when a Doc already embedded as a
+    subdocument is embedded again. Create a second Doc with the same guid
+    instead.
+
+var ErrUnsupportedAttributeValue = fmt.Errorf("ygo/crdt: attribute value outside the lib0 any domain")
+    ErrUnsupportedAttributeValue is returned by NewContentAttribute for values
+    outside the lib0 "any" domain.
+
+
+FUNCTIONS
+
+func ApplyUpdateV1(doc *Doc, update []byte, origin any) error
+    ApplyUpdateV1 decodes and integrates a V1 binary update into doc. When it
+    changes formatted text, a local transaction with a nil origin may follow it,
+    once its observers have fired, to clean up the format markers it left
+    redundant, as in Yjs, with its own update and observer callbacks.
+
+func ApplyUpdateV1Landed(doc *Doc, update []byte, origin any) (landed []byte, err error)
+    ApplyUpdateV1Landed is ApplyUpdateV1 for a caller that must forward what a
+    failed apply left behind. ApplyUpdateV1 integrates an update item by item,
+    so one it rejects (an update that overflows the pending cap, say) can
+    leave part of itself in doc. When the apply fails, landed is a V1 update
+    of exactly what this call integrated: the structs it added to doc's store
+    and the deletions it made, not structs still parked, nor the rest of the
+    document. landed is nil when the apply succeeds or when nothing integrated.
+
+func ApplyUpdateV2(doc *Doc, update []byte, origin any) error
+    ApplyUpdateV2 decodes and integrates a Yjs V2 binary update into doc.
+    When it changes formatted text, a local transaction with a nil origin may
+    follow it, once its observers have fired, to clean up the format markers it
+    left redundant, as in Yjs, with its own update and observer callbacks.
+
+func DiffUpdateV1(update []byte, sv StateVector) ([]byte, error)
+    DiffUpdateV1 returns the portion of update that a peer with state vector sv
+    is missing: structs whose clock range extends past sv are kept (sliced at
+    the sv boundary), and the full delete set is preserved (deletions are small
+    and idempotent — matching Yjs diffUpdate). (Previously this dropped parked
+    structs; #125.)
+
+func DiffUpdateV2(update []byte, sv StateVector) ([]byte, error)
+    DiffUpdateV2 returns the portion of a V2 update missing from sv (structs
+    sliced at the sv boundary; full delete set preserved). (#57)
+
+func DocContainsUpdateV1(doc *Doc, update []byte) (bool, error)
+    DocContainsUpdateV1 reports whether doc already holds everything the V1
+    update carries, as SnapshotContainsUpdateV1(CaptureSnapshot(doc), update)
+    does, without building a snapshot: update is decoded before doc is locked,
+    doc is held under its read lock only, its structs are compared against
+    doc's clocks, and its deletion ranges are checked against doc's store in one
+    forward pass per client. update is not integrated; one that does not decode
+    returns an error wrapping ErrInvalidUpdate.
+
+func EncodeContentIDs(c ContentIDs) []byte
+    EncodeContentIDs encodes c as inserts then deletes, following yjs-main's
+    writeContentIds composition (src/utils/meta.js): two IdSets concatenated.
+    Each half's wire format is byte-verified against published yjs v14; the
+    published yjs v14 rc line has no top-level writeContentIds/ContentIds export
+    to pin the wrapper itself against (see attribution_js_compat_test.go).
+
+func EncodeContentMap(c ContentMap) []byte
+    EncodeContentMap encodes c as inserts then deletes, following yjs-main's
+    writeContentMap composition (src/utils/meta.js): two IdMaps concatenated.
+    Each half's wire format is byte-verified against published yjs v14. The
+    published yjs v14 rc line has no top-level writeContentMap/ContentMap export
+    to pin the wrapper itself against — that API exists only on yjs's unreleased
+    main branch (see attribution_js_compat_test.go and the follow-up issue to
+    re-verify once yjs v14.0.0 final ships).
+
+func EncodeIDMap(m *IDMap) []byte
+    EncodeIDMap encodes m in the yjs-v14 IdMap binary format. All attributes
+    must come from NewContentAttribute (or otherwise stay within the lib0
+    any domain); hand-constructed literals with unsupported values panic in
+    WriteAny.
+
+func EncodeIDSet(s *IDSet) []byte
+    EncodeIDSet encodes s in the yjs-v14 IdSet binary format (IdSetEncoderV2).
+
+func EncodeRelativePosition(rp RelativePosition) []byte
+    EncodeRelativePosition serialises rp to bytes using the Yjs wire format,
+    interoperable with Y.encodeRelativePosition / Y.decodeRelativePosition.
+
+    Wire layout (matching Yjs writeRelativePosition — note the tag values,
+    which the previous ygo encoding had wrong, breaking all cross-language
+    cursor interop, review finding C-4):
+      - item-anchored: VarUint(0) + VarUint(client) + VarUint(clock)
+      - tname-anchored: VarUint(1) + VarString(tname)
+      - type-anchored: VarUint(2) + VarUint(client) + VarUint(clock)
+
+    followed by VarInt(assoc).
+
+func EncodeSnapshot(snap *Snapshot) []byte
+    EncodeSnapshot serialises snap to bytes in the Yjs V1 snapshot format,
+    interoperable with Y.encodeSnapshot / Y.decodeSnapshot.
+
+    Wire layout (matching Yjs encodeSnapshotV2 with a V1 encoder): the delete
+    set FIRST, then the state vector, concatenated into a single stream with
+    NO outer length prefixes — `writeDeleteSet(enc, ds); writeStateVector(enc,
+    sv)`. The previous ygo layout wrote the state vector first, each block
+    wrapped in its own VarBytes length prefix, which no Yjs peer could parse
+    (review finding F-5).
+
+func EncodeStateAsUpdateV1(doc *Doc, sv StateVector) []byte
+    EncodeStateAsUpdateV1 encodes the part of doc newer than sv as a V1 binary
+    update. Pass nil to encode the entire document state.
+
+func EncodeStateAsUpdateV2(doc *Doc, sv StateVector) []byte
+    EncodeStateAsUpdateV2 encodes the document state using the Yjs V2
+    column-oriented binary format. The output is interoperable with
+    Y.applyUpdateV2 / Y.encodeStateAsUpdateV2 from the yjs npm package.
+
+func EncodeStateFromSnapshot(doc *Doc, snap *Snapshot) ([]byte, error)
+    EncodeStateFromSnapshot returns a V1 update representing doc's state at snap
+    time. Apply it to a fresh Doc to reconstruct the historical version.
+
+    Like CreateDocFromSnapshot, doc must have been created WithGC(false):
+    a GC-enabled source may have discarded content the snapshot references, so
+    this returns ErrSnapshotSourceGCed rather than a silently-incomplete export.
+    Do not call it from inside a Transact callback — it takes the doc lock and
+    would deadlock.
+
+func EncodeStateVectorFromUpdate(update []byte) ([]byte, error)
+    EncodeStateVectorFromUpdate extracts the state vector described by a V1
+    update — the next clock per client (max struct end) — without integrating
+    it. Useful for computing what a peer is missing directly from an update.
+    (#57)
+
+func EncodeStateVectorFromUpdateV2(update []byte) ([]byte, error)
+    EncodeStateVectorFromUpdateV2 extracts the state vector described by a V2
+    update (next clock per client) without integrating it. The state vector wire
+    format is identical to V1 (client/clock varuint pairs). (#57)
+
+func EncodeStateVectorV1(doc *Doc) []byte
+    EncodeStateVectorV1 serialises the document's state vector as a compact
+    binary blob (VarUint count, then client/clock pairs).
+
+func EqualSnapshots(a, b *Snapshot) bool
+    EqualSnapshots reports whether a and b represent exactly the same state.
+
+func MergeUpdatesV1(updates ...[]byte) ([]byte, error)
+    MergeUpdatesV1 merges several V1 updates into one. Structs are merged at the
+    struct level (preserving non-integrable structs and clock gaps) and delete
+    sets are unioned — matching Yjs mergeUpdates. (Previously this applied to a
+    temp Doc and re-encoded, silently dropping parked structs; #125.)
+
+func MergeUpdatesV2(updates ...[]byte) ([]byte, error)
+    MergeUpdatesV2 merges several V2 updates into one at the struct level
+    (preserving non-integrable structs and clock gaps; unioning delete sets).
+    (#57)
+
+func RunGC(doc *Doc)
+    RunGC replaces the content of deleted items with lightweight ContentDeleted
+    tombstones, freeing memory while preserving the structural position
+    information required for CRDT correctness. It then merges adjacent
+    ContentDeleted items from the same client into single nodes, compacting the
+    linked list.
+
+    This is a no-op when doc.gc is false. After RunGC runs, RestoreDocument
+    can no longer reconstruct states that predate the GC'd deletions — take
+    snapshots before calling RunGC if you need to preserve history.
+
+func SnapshotContainsUpdateV1(snap *Snapshot, update []byte) (bool, error)
+    SnapshotContainsUpdateV1 reports whether snap already holds everything the
+    V1 update carries: every struct in update lies below snap's state vector,
+    and every deletion in it is in snap's delete set, so applying update to
+    the document snap was taken from would change nothing. update is decoded
+    without being integrated; one that does not decode returns an error wrapping
+    ErrInvalidUpdate. Matches Yjs snapshotContainsUpdate.
+
+func UpdateV1ToV2(v1 []byte) ([]byte, error)
+    UpdateV1ToV2 converts a V1 update payload to real Yjs V2 format. It works
+    at the struct level, like MergeUpdatesV1, so an incremental or delete-only
+    update converts intact (integrating into a scratch doc parked such updates
+    and emitted an empty one; yjs convertUpdateFormatV1ToV2 parity).
+
+func UpdateV2ToV1(v2 []byte) ([]byte, error)
+    UpdateV2ToV1 converts a real Yjs V2 update to V1 format, at the struct level
+    (see UpdateV1ToV2).
+
+
+TYPES
+
+type AbsolutePosition struct {
+	// Name is the root type name the position belongs to.
+	Name string
+	// Index is the logical position within the type.
+	Index int
+	// Assoc is carried over from the RelativePosition.
+	Assoc int
+}
+    AbsolutePosition is the result of resolving a RelativePosition against the
+    current document state. Index is expressed in UTF-16 code units (matching
+    Yjs / JavaScript semantics) for YText, or in item count for YArray/YMap.
+
+func ToAbsolutePosition(doc *Doc, rp RelativePosition) (AbsolutePosition, bool)
+    ToAbsolutePosition resolves rp against doc's current state and returns the
+    logical index within the named type.
+
+    Returns (pos, true) on success. Returns (zero, false) if the anchor item no
+    longer exists (e.g. it was GC'd after the position was created).
+
+    The resolution algorithm matches toAbsolutePosition in the Yjs JS reference
+    implementation.
+
+type AttrRange struct {
+	Clock uint64
+	Len   uint64
+	Attrs []*ContentAttribute
+}
+    AttrRange is a run of item IDs [Clock, Clock+Len) carrying attribution.
+    In IDMap.Slice output, Attrs == nil marks an unattributed gap.
+
+type Attributes map[string]any
+    Attributes is a map of rich-text formatting attribute name → value.
+
+    YText entry points store each value in a form both V1 (JSON text) and V2
+    (lib0 Any) encode: typed slices and maps become []any and map[string]any,
+    integers int64, and a json.Number, struct or other marshaler its JSON form.
+    They panic on a value with no such form (func, chan, complex, a shared type
+    or Doc, or nesting deeper than 100 levels). A NaN or ±Inf is accepted;
+    V1 writes it as null, as JSON.stringify does.
+
+type ClientID uint64
+    ClientID uniquely identifies a collaborating peer.
+
+func NewClientID() ClientID
+    NewClientID generates a fresh ClientID via crypto/rand.
+
+    The 32-bit space matches Yjs JS upstream (which uses uint32 to stay within
+    JavaScript's Number.MAX_SAFE_INTEGER). With uniform random distribution,
+    the birthday-bound for collisions is around 65k peers — beyond that,
+    collisions become probable. For multi-tenant deployments, callers may
+    want to coordinate IDs externally; the random generation here is a
+    collision-avoidance heuristic, not an authentication primitive. See
+    SECURITY.md.
+
+type Content interface {
+	// Len returns how many logical positions this content occupies.
+	// For ContentString this is the number of UTF-16 code units, matching Yjs
+	// wire-protocol semantics (JavaScript's string length model).
+	Len() int
+	// IsCountable reports whether this content contributes to a type's length.
+	// Deleted and format-marker content do not count.
+	IsCountable() bool
+	// Copy returns a deep copy.
+	Copy() Content
+	// Splice splits the content at offset, mutates the receiver to hold [0, offset),
+	// and returns a new Content holding [offset, Len()).
+	Splice(offset int) Content
+}
+    Content is the payload carried by an Item. Every concrete content type must
+    implement this interface.
+
+type ContentAny struct{ Vals []any }
+    ContentAny holds a slice of arbitrary JSON-compatible values. Used by YArray
+    when storing heterogeneous elements.
+
+func NewContentAny(vals ...any) *ContentAny
+    NewContentAny creates a ContentAny, normalising Go int values to int64 so
+    that locally-stored integers are wire-compatible with values decoded from
+    V1/V2 updates (ReadAny returns int64 for VarInt-encoded integers).
+
+func (c *ContentAny) Copy() Content
+
+func (c *ContentAny) IsCountable() bool
+
+func (c *ContentAny) Len() int
+
+func (c *ContentAny) Splice(offset int) Content
+
+type ContentAttribute struct {
+	Name  string
+	Value any
+}
+    ContentAttribute is one attribution fact attached to a range of item IDs,
+    e.g. {"userid","alice"} or {"ts",int64(1719...)}. Value must stay within the
+    lib0 "any" domain (see NewContentAttribute); use NewContentAttribute rather
+    than a struct literal so invalid values fail at the point of the mistake
+    instead of panicking inside EncodeIDMap.
+
+func MustContentAttribute(name string, value any) *ContentAttribute
+    MustContentAttribute is NewContentAttribute that panics on invalid values.
+    Intended for tests and compile-time-constant literals.
+
+func NewContentAttribute(name string, value any) (*ContentAttribute, error)
+    NewContentAttribute validates value against the encodable lib0 domain
+    and returns the attribute. Containers are validated recursively.
+    name must be valid UTF-8 (it is written to the wire via WriteVarString
+    in writeIDMap/attrKey); ErrInvalidUTF8 is crdt's re-export of
+    encoding.ErrInvalidUTF8, so errors.Is matches whichever sentinel a caller
+    compares against.
+
+type ContentBinary struct{ Data []byte }
+    ContentBinary holds raw bytes (e.g. binary file attachments).
+
+func NewContentBinary(b []byte) *ContentBinary
+
+func (c *ContentBinary) Copy() Content
+
+func (c *ContentBinary) IsCountable() bool
+
+func (c *ContentBinary) Len() int
+
+func (c *ContentBinary) Splice(_ int) Content
+
+type ContentDeleted struct {
+	// Has unexported fields.
+}
+    ContentDeleted is a tombstone. It replaces real content when an item is
+    deleted but must stay in the linked list to preserve position references.
+
+func NewContentDeleted(length int) *ContentDeleted
+
+func (c *ContentDeleted) Copy() Content
+
+func (c *ContentDeleted) IsCountable() bool
+
+func (c *ContentDeleted) Len() int
+
+func (c *ContentDeleted) Splice(offset int) Content
+
+type ContentDoc struct{ Doc *Doc }
+    ContentDoc holds a reference to a subdocument.
+
+func NewContentDoc(d *Doc) *ContentDoc
+
+func (c *ContentDoc) Copy() Content
+    Copy returns a ContentDoc wrapping a FRESH Doc with the same guid and opts.
+    A Doc may be embedded only once (its item back-reference is single-valued),
+    so item copies during split/merge must not alias one inner Doc. Mirrors Yjs
+    ContentDoc.copy / createDocFromOpts.
+
+func (c *ContentDoc) IsCountable() bool
+
+func (c *ContentDoc) Len() int
+
+func (c *ContentDoc) Splice(_ int) Content
+
+type ContentEmbed struct{ Val any }
+    ContentEmbed holds a single embedded object (e.g. an image or formula in
+    rich text).
+
+func NewContentEmbed(val any) *ContentEmbed
+
+func (c *ContentEmbed) Copy() Content
+
+func (c *ContentEmbed) IsCountable() bool
+
+func (c *ContentEmbed) Len() int
+
+func (c *ContentEmbed) Splice(_ int) Content
+
+type ContentFormat struct {
+	Key string
+	Val any
+}
+    ContentFormat marks the start of a formatting attribute span in YText.
+    It does not contribute to the document's logical length.
+
+func NewContentFormat(key string, val any) *ContentFormat
+
+func (c *ContentFormat) Copy() Content
+
+func (c *ContentFormat) IsCountable() bool
+
+func (c *ContentFormat) Len() int
+
+func (c *ContentFormat) Splice(_ int) Content
+
+type ContentIDs struct {
+	Inserts *IDSet
+	Deletes *IDSet
+}
+    ContentIDs records which item IDs an update (or doc) inserted and deleted.
+    It is the yjs-v14 ContentIds (src/utils/meta.js). Not goroutine-safe.
+
+func ContentIDsFromUpdateV1(update []byte) (ContentIDs, error)
+    ContentIDsFromUpdateV1 extracts the inserted and deleted item IDs from a V1
+    update without integrating it — the entry point for stamping an incoming
+    update with attribution (issue #56). Skip structs are placeholders and are
+    excluded.
+
+func ContentIDsFromUpdateV2(update []byte) (ContentIDs, error)
+    ContentIDsFromUpdateV2 is ContentIDsFromUpdateV1 for V2 updates.
+
+func DecodeContentIDs(data []byte) (ContentIDs, error)
+    DecodeContentIDs decodes data produced by EncodeContentIDs.
+
+type ContentJSON struct{ Vals []any }
+    ContentJSON holds legacy JSON-serializable values. Functionally equivalent
+    to ContentAny; kept separate to maintain wire-format compatibility.
+
+func NewContentJSON(vals ...any) *ContentJSON
+
+func (c *ContentJSON) Copy() Content
+
+func (c *ContentJSON) IsCountable() bool
+
+func (c *ContentJSON) Len() int
+
+func (c *ContentJSON) Splice(offset int) Content
+
+type ContentMap struct {
+	Inserts *IDMap
+	Deletes *IDMap
+}
+    ContentMap attaches attribution metadata to inserted and deleted IDs.
+    It is the yjs-v14 ContentMap (formerly TwosetAttributionManager). Not
+    goroutine-safe.
+
+func CreateContentMapFromContentIDs(ids ContentIDs, insertAttrs, deleteAttrs []*ContentAttribute) ContentMap
+    CreateContentMapFromContentIDs stamps every insert range
+    with insertAttrs and every delete range with deleteAttrs (yjs
+    createContentMapFromContentIds). A nil deleteAttrs defaults to insertAttrs,
+    matching the yjs signature default.
+
+func DecodeContentMap(data []byte) (ContentMap, error)
+    DecodeContentMap decodes data produced by EncodeContentMap.
+
+func ExcludeContentMap(m ContentMap, ids ContentIDs) ContentMap
+    ExcludeContentMap removes ids' ranges from both halves (yjs
+    excludeContentMap).
+
+func FilterContentMap(m ContentMap, insertPred, deletePred func([]*ContentAttribute) bool) ContentMap
+    FilterContentMap filters both halves by their predicates (yjs
+    filterContentMap).
+
+func IntersectContentMaps(a, b ContentMap) ContentMap
+    IntersectContentMaps intersects both halves (yjs intersectContentMap).
+
+func MergeContentMaps(maps ...ContentMap) ContentMap
+    MergeContentMaps merges both halves of every input (yjs mergeContentMaps).
+
+type ContentMove struct {
+	Target    *ID
+	TargetLen int
+}
+    ContentMove is a CRDT-safe array move marker. It sits at the destination
+    position in the linked list and causes the target item to be rendered there
+    instead of at its original position. ContentMove is non-countable (it does
+    not contribute to the array's logical length) and occupies one clock slot.
+
+    When two ContentMove items target the same item, the lower ClientID wins,
+    and between one client's moves the latest wins. The losing ContentMove stays
+    in the linked list but renders nothing because target.MovedBy points to the
+    winning item.
+
+    TargetLen is the expected length of the target item (always 1 for
+    single-element moves). It is stored in the wire format so that receivers
+    can force-split a multi-value ContentAny item at the exact boundary when
+    applying delta updates, ensuring the same item granularity on all peers.
+
+func NewContentMove(target *ID, targetLen int) *ContentMove
+
+func (c *ContentMove) Copy() Content
+
+func (c *ContentMove) IsCountable() bool
+
+func (c *ContentMove) Len() int
+
+func (c *ContentMove) Splice(_ int) Content
+
+type ContentString struct {
+	Str string
+	// Has unexported fields.
+}
+    ContentString holds a run of UTF-8 text from a single client. Multiple
+    consecutive characters typed by the same client are squashed into one item,
+    keeping the linked list short.
+
+    utf16Len caches the UTF-16 code unit length of Str so that Len() is O(1).
+    The Yjs wire protocol and JavaScript String.length both count in UTF-16
+    units, so indices exchanged with JS peers must use the same unit. Characters
+    in the Basic Multilingual Plane count as 1; supplementary characters (e.g.
+    most emoji) count as 2. Any code that mutates Str directly must also update
+    utf16Len.
+
+func NewContentString(s string) *ContentString
+
+func (c *ContentString) Copy() Content
+
+func (c *ContentString) IsCountable() bool
+
+func (c *ContentString) Len() int
+    Len returns the number of UTF-16 code units, matching Yjs wire-protocol
+    index semantics. This is NOT the same as len(s) (bytes) or rune count when
+    the string contains characters outside the Basic Multilingual Plane.
+
+func (c *ContentString) Splice(offset int) Content
+
+type ContentType struct{ Type *abstractType }
+    ContentType holds a reference to a nested shared type (e.g. a YMap nested
+    inside a YArray). The linked item acts as the "container" for the child
+    type.
+
+func NewContentType(t *abstractType) *ContentType
+
+func (c *ContentType) Copy() Content
+    Copy wraps a FRESH, empty type of the same kind: a type's item back-pointer
+    and child list are single-valued, so a re-inserted copy must not alias the
+    original. Mirrors Yjs ContentType.copy; UndoManager.redoItem re-inserts the
+    children itself.
+
+func (c *ContentType) IsCountable() bool
+
+func (c *ContentType) Len() int
+
+func (c *ContentType) Splice(_ int) Content
+
+type DeleteRange struct {
+	Clock uint64
+	Len   uint64
+}
+    DeleteRange is a contiguous range of deleted clocks for a single client.
+
+type DeleteSet struct {
+	// Has unexported fields.
+}
+    DeleteSet tracks which Items have been deleted, stored as sorted,
+    non-overlapping ranges per client. This compact representation is what
+    travels on the wire.
+
+func (ds *DeleteSet) Clients() []ClientID
+    Clients returns the client IDs that have at least one deleted range in ds.
+
+func (ds *DeleteSet) IsDeleted(id ID) bool
+    IsDeleted reports whether the item at the given ID has been marked deleted.
+
+func (ds *DeleteSet) Merge(other DeleteSet)
+    Merge incorporates all ranges from other into ds, appending other's new
+    clients after ds's (Yjs mergeDeleteSets order).
+
+type Delta struct {
+	Op         DeltaOp
+	Insert     any        // string or embedded object; valid when Op == DeltaOpInsert
+	Delete     int        // character count; valid when Op == DeltaOpDelete
+	Retain     int        // character count; valid when Op == DeltaOpRetain
+	Attributes Attributes // formatting change; valid for Insert and Retain
+}
+    Delta represents one operation in a rich-text changeset: insert new content,
+    delete existing content, or retain (and optionally re-format) existing
+    content.
+
+type DeltaOp int
+    DeltaOp is the kind of operation in a rich-text Delta.
+
+const (
+	DeltaOpInsert DeltaOp = iota
+	DeltaOpDelete
+	DeltaOpRetain
+)
+type Doc struct {
+	// Has unexported fields.
+}
+    Doc is the root of a Yjs collaborative document. All shared types (YArray,
+    YMap, YText, …) live inside a Doc.
+
+func CreateDocFromSnapshot(src *Doc, snap *Snapshot) (*Doc, error)
+    CreateDocFromSnapshot reconstructs the document state captured by
+    snap into a new, independent Doc — the Go equivalent of Yjs JS's
+    createDocFromSnapshot. Items inserted after the snapshot are excluded,
+    and only deletions present in the snapshot's DeleteSet are applied;
+    a key/element deleted after the snapshot reappears in the reconstruction.
+
+    src must have been created WithGC(false) (the snapshot-history pattern):
+    a GC-enabled source may have discarded the content/tombstones the snapshot
+    references, so reconstruction returns ErrSnapshotSourceGCed rather than
+    a silently-wrong doc. The returned doc is itself non-GC, so it can be
+    snapshotted or restored from again.
+
+    Do not call from inside a Transact callback: it acquires src's lock and
+    would deadlock — resolve the snapshot outside the transaction.
+
+func New(opts ...DocOption) *Doc
+    New creates a new Doc with a randomly generated ClientID.
+
+func RestoreDocument(doc *Doc, snap *Snapshot) (*Doc, error)
+    RestoreDocument creates a new Doc that reflects doc's state at the time
+    snap was taken. Items inserted after the snapshot are excluded, and only
+    deletions present in the snapshot's DeleteSet are applied.
+
+    Retained for backward compatibility; it delegates to CreateDocFromSnapshot
+    (the Yjs-parity name) and shares its GC-safety guard — see
+    ErrSnapshotSourceGCed.
+
+func (d *Doc) ApplyUpdate(update []byte) error
+    ApplyUpdate decodes and integrates a V1 binary update into the document.
+
+func (d *Doc) AutoLoad() bool
+    AutoLoad returns whether this subdocument should be auto-loaded by remote
+    peers.
+
+func (d *Doc) ClientID() ClientID
+    ClientID returns the document's client identifier (read-only after
+    creation).
+
+func (d *Doc) CollectionID() string
+    CollectionID returns the optional subdocument collection identifier.
+
+func (d *Doc) Destroy()
+    Destroy detaches all observers and clears internal state, releasing
+    references held by the document. After Destroy the document must not be
+    used.
+
+func (d *Doc) EncodeStateAsUpdate() []byte
+    EncodeStateAsUpdate encodes the full document state as a V1 binary update.
+
+func (d *Doc) GUID() string
+    GUID returns the document's identifier. Every Doc has one — a random uuidv4
+    by default (Yjs parity), or the value passed to WithGUID.
+
+func (d *Doc) GetArray(name string) *YArray
+    GetArray returns the named root YArray, creating it if it does not exist.
+    It takes the document lock — inside a Transact callback use txn.GetArray
+    instead (see Transact and GetText for the locking contract; issue #138).
+
+func (d *Doc) GetMap(name string) *YMap
+    GetMap returns the named root YMap, creating it if it does not exist. It
+    takes the document lock — inside a Transact callback use txn.GetMap instead
+    (see Transact and GetText for the locking contract; issue #138).
+
+func (d *Doc) GetSubdocGUIDs() []string
+    GetSubdocGUIDs returns the guids of the resident subdocuments, sorted.
+
+func (d *Doc) GetSubdocs() []*Doc
+    GetSubdocs returns the resident subdocuments, sorted by guid.
+
+func (d *Doc) GetText(name string) *YText
+    GetText returns the named root YText, creating it if it does not exist.
+
+    GetText takes the document lock and therefore MUST NOT be called from
+    inside a Transact callback — that self-deadlocks a non-reentrant lock,
+    silently (issue #138). Inside a transaction use txn.GetText, or resolve the
+    handle first:
+
+        txt := doc.GetText("t")
+        doc.Transact(func(txn *crdt.Transaction) { txt.Insert(txn, 0, "hi", nil) })
+
+func (d *Doc) GetXmlFragment(name string) *YXmlFragment
+    GetXmlFragment returns the named root YXmlFragment, creating it if it
+    does not exist. It takes the document lock — inside a Transact callback
+    use txn.GetXmlFragment instead (see Transact and GetText for the locking
+    contract; issue #138).
+
+func (d *Doc) Load()
+    Load signals that this subdocument's data should be synced. On a subdocument
+    it sets shouldLoad=true and emits a subdocs "loaded" event on the parent;
+    on a root doc it just sets shouldLoad=true. Safe to call multiple times.
+
+    Load opens a transaction on the PARENT document, so it MUST NOT be
+    called from inside a Transact closure (re-entrant lock — same footgun as
+    GetText-in-Transact).
+
+func (d *Doc) OnAfterTransaction(fn func(*Transaction)) func()
+    OnAfterTransaction registers a callback that fires after every committed
+    transaction, receiving the full Transaction object. This provides richer
+    change metadata than OnUpdate (beforeState, afterState, deleteSet, Local
+    flag) and is the hook used by UndoManager. Returns an unsubscribe function.
+
+func (d *Doc) OnSubdocs(fn func(SubdocsEvent)) func()
+    OnSubdocs registers a callback fired once after any transaction that adds,
+    removes, or loads subdocuments. Returns an unsubscribe function. Mirrors
+    OnUpdate (safe concurrent, out-of-order unsubscribe).
+
+func (d *Doc) OnUpdate(fn func(update []byte, origin any)) func()
+    OnUpdate registers a callback that fires after every committed transaction.
+    The callback receives the incremental V1 update bytes for that transaction
+    and the origin value passed to Transact. Returns an unsubscribe function.
+
+    Callbacks that compare the origin (an echo guard, a per-user filter) do
+    so with Go ==, so the caution on Transact's doc applies: pointer origin
+    tokens must point at non-zero-size types, or distinct tokens may alias
+    (runtime.zerobase, #203).
+
+    The unsubscribe function is safe to call concurrently and handles
+    out-of-order unsubscription correctly (no index-capture bug).
+
+func (d *Doc) PendingStats() PendingStats
+    PendingStats returns a snapshot of the pending-queue state. Cheap; takes
+    a read lock and copies a few values. Intended for operational monitoring
+    of out-of-order delta convergence; see v1.2.0 release notes for the
+    pending-structs machinery this exposes.
+
+func (d *Doc) ShouldLoad() bool
+    ShouldLoad returns whether a provider should sync this doc now.
+
+func (d *Doc) StateVector() StateVector
+    StateVector returns the current state vector of the document.
+
+func (d *Doc) Transact(fn func(*Transaction), origin ...any)
+    Transact executes fn inside a transaction. All insertions and deletions made
+    during fn are batched; observers fire once after fn returns.
+
+    The optional origin value tags the transaction: observers receive it
+    (OnUpdate's origin parameter, Transaction.Origin) and UndoManager's
+    WithTrackedOrigins filters on it — always by Go interface equality (==).
+    If you mint per-caller origin tokens as pointers, use a pointer to a
+    NON-zero-size type (e.g. type token struct{ _ byte }): pointers to
+    zero-size types may all share one address (runtime.zerobase) and compare
+    equal, silently merging origins that were meant to be distinct — see
+    WithTrackedOrigins' doc for the full trap (#203).
+
+    Transact holds the document write lock for the duration of fn. Anything
+    that takes that same non-reentrant lock MUST NOT be called from inside fn
+    — it deadlocks silently, and Go exposes no goroutine identity with which to
+    detect it (issue #138). That includes the Doc-level root accessors (GetMap,
+    GetText, GetArray, GetXmlFragment), Doc.Load, observer registration
+    (Observe, ObserveDeep, OnUpdate, OnAfterTransaction, OnSubdocs), and —
+    notably — nested Transact on the same Doc, which remains an undetected
+    deadlock.
+
+    Inside fn, resolve root types through the Transaction instead — its
+    accessors reuse the lock the transaction already holds — or resolve handles
+    before the transaction:
+
+        doc.Transact(func(txn *crdt.Transaction) {
+            txn.GetMap("m").Set(txn, "k", 1) // in-transaction accessor: works
+        })
+
+        m := doc.GetMap("m") // or: resolve outside...
+        doc.Transact(func(txn *crdt.Transaction) {
+            m.Set(txn, "k", 1) // ...and use the handle inside
+        })
+
+    (Observer callbacks are NOT affected — they fire after the lock is released
+    and may call any Doc method; see below.)
+
+    Observers are intentionally fired OUTSIDE the document lock. This means:
+      - Observer callbacks may safely call back into any Doc method (Transact,
+        GetArray, ApplyUpdate, etc.) without deadlocking.
+      - The document may be modified by another goroutine between the time fn
+        returns and the time observers fire; observers should treat txn as a
+        snapshot of what changed, not a live view of the current state.
+
+    Panic semantics:
+      - If fn panics (or any Phase 1 work panics), d.mu is released via defer.
+      - Observers fire with whatever partial state was committed before the
+        panic: OnUpdate receives a V1 update describing the mutations that
+        completed (non-empty if fn mutated; minimal but well-formed if fn
+        panicked before mutating); per-type, deep, and OnAfterTransaction
+        observers fire for what was recorded in txn.changed.
+      - The original panic is re-raised to the caller after observers fire.
+      - Rollback is NOT supported. The in-memory doc reflects fn's partial
+        work. Callers who need atomicity must implement it above Transact.
+        This matches the behavior of Yjs JS and the Rust yrs implementation;
+        yrs explicitly directs users to UndoManager for transactional undo.
+      - If fn panics and an observer callback also panics during the partial
+        firing, the observer's panic reaches the caller and the original fn
+        panic value is lost.
+
+func (d *Doc) TransactContext(ctx context.Context, fn func(*Transaction), origin ...any) error
+    TransactContext is like Transact but associates a context with the
+    transaction so fn can cooperatively observe cancellation.
+
+    If ctx is already cancelled when TransactContext is called, fn is not
+    invoked and ctx.Err() is returned immediately.
+
+    Inside fn, callers can poll txn.Ctx().Err() or <-txn.Ctx().Done() to detect
+    cancellation and return early. Any mutations fn completed before returning
+    are committed (no rollback, consistent with the Transact panic-safety
+    contract — see Transact's godoc).
+
+    If ctx cancels during fn and fn does not poll, fn runs to completion —
+    Go has no safe mechanism for interrupting arbitrary fn code. ctx.Err() is
+    returned after the transaction commits as a "missed cancellation" signal to
+    the caller. It is not an error flag for the mutations; those are committed
+    either way.
+
+    Neither Yjs JS nor the Rust yrs implementation offers mid-fn interruption
+    either; cooperative polling is the ecosystem norm.
+
+func (d *Doc) TransactContextE(ctx context.Context, fn func(*Transaction) error, origin ...any) error
+    TransactContextE is like TransactContext but allows fn to return an error.
+    It combines context-cancellation awareness with fn-error propagation.
+
+      - If ctx is already cancelled when TransactContextE is called, fn is not
+        invoked and ctx.Err() is returned immediately.
+      - If fn returns nil and ctx is not cancelled after the transaction
+        commits, TransactContextE returns nil.
+      - If fn returns a non-nil error but ctx is still fine, that error is
+        returned.
+      - If ctx cancels during fn (cooperative only — Go cannot safely interrupt
+        arbitrary fn code), ctx.Err() wins over fn's error. This matches
+        the precedent set by TransactContext and Yjs JS's ecosystem norm of
+        cooperative cancellation polling via txn.Ctx().
+      - Mutations commit regardless of fn's error or ctx cancellation (no
+        rollback — matches Yjs JS doc.transact(f) and yrs semantics).
+      - Observers fire BEFORE TransactContextE returns, even when fn errors.
+      - Panics in fn follow the v1.1.1 panic-safety contract (partial commit,
+        observer fire, re-raise).
+
+func (d *Doc) TransactE(fn func(*Transaction) error, origin ...any) error
+    TransactE is like Transact but allows fn to return an error. The error is
+    returned to the caller after all observers have fired. Mutations commit
+    regardless of the error (no rollback — matches Yjs JS doc.transact(f) and
+    the Rust yrs implementation).
+
+      - If fn returns nil, TransactE returns nil.
+      - If fn returns a non-nil error, that error becomes the return value of
+        TransactE. Mutations that fn completed before returning are committed.
+      - Observers (OnUpdate, OnAfterTransaction, per-type) fire BEFORE TransactE
+        returns the error — matching the Yjs JS "finally-block observer"
+        pattern.
+      - If fn panics, the existing v1.1.1 panic-safety contract applies: partial
+        state commits, observers fire with partial changes, and the panic is
+        re-raised to the caller. TransactE does not swallow panics.
+
+type DocOption func(*Doc)
+    DocOption configures a Doc at creation time.
+
+func WithAutoLoad(v bool) DocOption
+    WithAutoLoad marks a subdocument to be auto-loaded by remote peers. Default
+    false.
+
+func WithClientID(id ClientID) DocOption
+    WithClientID sets a fixed ClientID instead of generating a random one.
+    Useful in tests and server-side scenarios where the ID must be
+    deterministic.
+
+func WithCollectionID(id string) DocOption
+    WithCollectionID sets an optional subdocument collection identifier.
+
+func WithGC(gc bool) DocOption
+    WithGC controls whether deleted item content is freed at the end of
+    each transaction. Default is true. Set to false to preserve history for
+    snapshots.
+
+func WithGUID(guid string) DocOption
+    WithGUID sets the document's subdocument identifier. When a Doc is embedded
+    inside another Doc via ContentDoc, the GUID identifies it across peers.
+
+func WithMaxPendingItems(n int) DocOption
+    WithMaxPendingItems caps the per-doc pending queue depth — items parked
+    waiting for out-of-order dependencies. Once the cap is reached, further
+    items that would be parked cause ApplyUpdate to return ErrInvalidUpdate.
+    Zero or negative uses the default (100,000).
+
+    This is a defence against a malicious peer crafting an update full of
+    far-future-clock items, which would otherwise grow the pending queue without
+    bound. See issue #46.
+
+func WithShouldLoad(v bool) DocOption
+    WithShouldLoad controls whether a provider should sync this doc now.
+    Default true; a decoded/remote subdocument starts false until Load().
+
+type ID struct {
+	Client ClientID
+	Clock  uint64
+}
+    ID is a Lamport-style logical timestamp that uniquely identifies an Item.
+    Only insertion operations increment the Clock; deletions do not.
+
+func (a ID) Equals(b ID) bool
+
+type IDMap struct {
+	// Has unexported fields.
+}
+    IDMap maps runs of item IDs to attribution metadata. It is the yjs-v14 IdMap
+    (src/utils/ids.js). Attributes are interned per map so pointer identity is
+    value identity, mirroring yjs object identity after _ensureAttrs.
+
+    An IDMap is not goroutine-safe.
+
+func DecodeIDMap(data []byte) (*IDMap, error)
+    DecodeIDMap decodes data produced by EncodeIDMap / yjs encodeIdMap.
+
+func ExcludeIDMap(m *IDMap, exclude *IDSet) *IDMap
+    ExcludeIDMap returns m minus the ranges in exclude, preserving attribution
+    (yjs _diffSet applied to an IdMap). A nil m is treated as empty; a nil
+    exclude excludes nothing.
+
+func FilterIDMap(m *IDMap, pred func([]*ContentAttribute) bool) *IDMap
+    FilterIDMap returns the ranges whose attrs satisfy pred (yjs filterIdMap).
+    A nil m has no ranges, so the result is empty.
+
+func IDMapFromIDSet(s *IDSet, attrList []*ContentAttribute) *IDMap
+    IDMapFromIDSet stamps every range of s with attrs (yjs
+    createIdMapFromIdSet). A nil s stamps to an empty IDMap.
+
+func IntersectIDMaps(a, b *IDMap) *IDMap
+    IntersectIDMaps returns the overlap of a and b; each overlap range carries
+    the concatenation of both sides' attrs (yjs _intersectSets on AttrRanges:
+    concat, no value-dedup — preserved for wire fidelity). A nil operand has no
+    ranges, so the result is empty.
+
+func MergeIDMaps(maps ...*IDMap) *IDMap
+    MergeIDMaps returns a fresh IDMap containing every attributed range of every
+    input. Attributes are re-interned into the result so value-equal attrs from
+    different inputs become one instance (yjs mergeIdMaps' attrMapper).
+
+func NewIDMap() *IDMap
+    NewIDMap returns an empty IDMap.
+
+func (m *IDMap) Add(client ClientID, clock, length uint64, attrs []*ContentAttribute)
+    Add records attribution attrs for the run [clock, clock+length) of client.
+    length 0 is a no-op. attrs are interned; later reads return the canonical
+    instances.
+
+func (m *IDMap) Clients() []ClientID
+    Clients returns clients owning at least one range, ascending.
+
+func (m *IDMap) Has(client ClientID, clock uint64) bool
+    Has reports whether (client, clock) is attributed.
+
+func (m *IDMap) IsEmpty() bool
+    IsEmpty reports whether the map contains no ranges.
+
+func (m *IDMap) Ranges(client ClientID) []AttrRange
+    Ranges returns the normalized attributed ranges for client (copy), or nil.
+
+func (m *IDMap) Slice(client ClientID, clock, length uint64) []AttrRange
+    Slice returns attribution covering [clock, clock+length) for client.
+    The result covers the whole span: attributed sub-ranges carry their Attrs,
+    and unattributed gaps are returned with Attrs == nil (yjs IdMap.slice).
+
+type IDRange struct {
+	Clock uint64
+	Len   uint64
+}
+    IDRange is a contiguous run of item IDs for a single client: clocks [Clock,
+    Clock+Len). Part of the attribution API (issue #56); the yjs-v14 counterpart
+    is IdRange in src/utils/ids.js.
+
+type IDSet struct {
+	// Has unexported fields.
+}
+    IDSet records which item IDs are in the set, as per-client sorted runs.
+    It is the yjs-v14 IdSet (src/utils/ids.js) — structurally a DeleteSet, but a
+    standalone public type: DeleteSet stays private to transaction internals.
+
+    An IDSet is not goroutine-safe.
+
+func DecodeIDSet(data []byte) (*IDSet, error)
+    DecodeIDSet decodes data produced by EncodeIDSet / yjs encodeIdSet.
+
+func DeleteSetFromDoc(doc *Doc) *IDSet
+    DeleteSetFromDoc returns the doc's delete set as an IDSet (yjs
+    createDeleteSetFromStructStore).
+
+func ExcludeIDSet(set, exclude *IDSet) *IDSet
+    ExcludeIDSet returns set minus exclude as a fresh IDSet (yjs diffIdSet).
+    A nil set is treated as empty; a nil exclude excludes nothing.
+
+func IDSetFromIDMap(m *IDMap) *IDSet
+    IDSetFromIDMap projects an IDMap onto a plain IDSet, dropping attribution
+    (yjs createIdSetFromIdMap). A nil m projects to an empty IDSet.
+
+func InsertSetFromDoc(doc *Doc, filterDeleted bool) *IDSet
+    InsertSetFromDoc returns the IDSet of every item run in the doc's store (yjs
+    createInsertSetFromStructStore). With filterDeleted, runs of deleted items
+    are excluded; consecutive surviving items coalesce into one range.
+
+func IntersectIDSets(a, b *IDSet) *IDSet
+    IntersectIDSets returns the overlap of a and b as a fresh IDSet (yjs
+    intersectSets). A nil operand has no ranges, so the result is empty.
+
+func MergeIDSets(sets ...*IDSet) *IDSet
+    MergeIDSets returns a fresh IDSet containing every range of every input (yjs
+    mergeIdSets). Inputs are not mutated.
+
+func NewIDSet() *IDSet
+    NewIDSet returns an empty IDSet.
+
+func (s *IDSet) Add(client ClientID, clock, length uint64)
+    Add records the run [clock, clock+length) for client. length 0 is a no-op.
+
+func (s *IDSet) Clients() []ClientID
+    Clients returns the clients that own at least one range, ascending.
+
+func (s *IDSet) Clone() *IDSet
+    Clone returns a deep copy.
+
+func (s *IDSet) Has(client ClientID, clock uint64) bool
+    Has reports whether (client, clock) is in the set.
+
+func (s *IDSet) HasID(id ID) bool
+    HasID reports whether id is in the set.
+
+func (s *IDSet) IsEmpty() bool
+    IsEmpty reports whether the set contains no ranges.
+
+func (s *IDSet) Ranges(client ClientID) []IDRange
+    Ranges returns the normalized ranges for client (a copy), or nil.
+
+type Item struct {
+	ID          ID
+	Origin      *ID   // ID of the left neighbour at insertion time; nil = inserted at start
+	OriginRight *ID   // ID of the right neighbour at insertion time; nil = inserted at end
+	Left        *Item // current left neighbour in the linked list
+	Right       *Item // current right neighbour
+	Parent      *abstractType
+	// ParentSub is the map key for YMap entries (and XML/Map-typed attributes).
+	// nil means "no key" — a sequence element (YArray / YText / XML child).
+	// A non-nil pointer to "" is a genuine empty-string key (m.Set("", v)),
+	// which Yjs supports and which must be distinguished from nil. (#YMap-wire)
+	ParentSub *string
+	Content   Content
+	Deleted   bool
+
+	// MovedBy points to the winning ContentMove item that has claimed this item
+	// as its target. When non-nil, this item is rendered at the ContentMove's
+	// position instead of its original linked-list position. Set by integrate()
+	// during ContentMove priority arbitration.
+	MovedBy *Item
+
+	// Has unexported fields.
+}
+    Item is the fundamental unit of the Yjs CRDT. Every insertion creates one
+    Item. Items form a doubly-linked list inside each shared type and are never
+    removed — deleted items become tombstones (Deleted = true, content replaced
+    by ContentDeleted when GC runs).
+
+type KeyChange struct {
+	Action   KeyChangeAction
+	OldValue any // nil when Action == KeyAdded
+}
+    KeyChange describes the per-key delta for a YMapEvent: what happened to
+    the key and, when applicable, what its previous value was. Mirrors Yjs JS's
+    `event.keys` Map<key, {action, oldValue}> and yrs's `MapEvent::keys()`.
+
+type KeyChangeAction string
+    KeyChangeAction describes how a single key was affected by a transaction.
+
+const (
+	// KeyAdded means the key did not exist before the transaction and now does.
+	KeyAdded KeyChangeAction = "add"
+	// KeyUpdated means the key existed before and now holds a different value.
+	KeyUpdated KeyChangeAction = "update"
+	// KeyDeleted means the key existed before and no longer does.
+	KeyDeleted KeyChangeAction = "delete"
+)
+type PendingStats struct {
+	// Items is the number of decoded items parked in the pending queue
+	// (waiting for cross-update Origin/OriginRight dependencies or
+	// same-client clock-gap dependencies to arrive).
+	Items int
+
+	// DeleteRanges is the total number of delete-set ranges in pendingDs
+	// across all clients. Each range is one [clock, clock+len) span.
+	DeleteRanges int
+
+	// MissingFor lists the ClientIDs that pending items reference but
+	// haven't yet received. Sorted ascending. Read-only.
+	MissingFor []ClientID
+}
+    PendingStats is a snapshot of the doc's pending-queue depth. Returned by
+    Doc.PendingStats. Used for observability — operators can monitor queue
+    growth to detect adversarial peers or persistent convergence gaps. The
+    snapshot is immediately stale; do not use as a synchronization primitive.
+
+type RelativePosition struct {
+	// Item is the ID of the item this position is anchored to.
+	// Nil anchors the position to the named root type (Tname) itself, which
+	// resolves to the end of the type when Assoc >= 0 and to the start when
+	// Assoc < 0 (matching Yjs toAbsolutePosition).
+	Item *ID
+
+	// Tname is the root type name; used when Item is nil.
+	Tname string
+
+	// Assoc controls which side of Item this position is on.
+	//   Assoc >= 0: cursor is after Item (default — use for most cursors).
+	//   Assoc <  0: cursor is before Item (use when cursor is at end of type,
+	//               since assoc=0 cannot stably represent end-of-type).
+	Assoc int
+	// Has unexported fields.
+}
+    RelativePosition encodes a document cursor that remains stable as items are
+    inserted or deleted around it. It anchors to a specific Item by ID rather
+    than to a numeric index, so concurrent edits cannot shift it.
+
+    Convert to an AbsolutePosition via ToAbsolutePosition whenever you need the
+    current numeric index (e.g. before displaying a cursor or applying an edit).
+
+    Wire format is compatible with Y.RelativePosition in the JavaScript Yjs
+    reference implementation.
+
+func CreateRelativePositionFromIndex(t sharedType, index int, assoc int) RelativePosition
+    CreateRelativePositionFromIndex creates a RelativePosition that points to
+    logical index within t. The position is anchored to the item at that index
+    so that subsequent insertions elsewhere do not shift it.
+
+    assoc controls which side of the boundary item the cursor is on:
+      - assoc >= 0 (default): cursor is after the anchor — use for most cursors.
+      - assoc < 0: cursor is before the anchor — required when positioning at
+        the exact end of a type (there is no item to the right to anchor to).
+
+    The algorithm matches createRelativePositionFromTypeIndex in the Yjs JS
+    reference implementation.
+
+func DecodeRelativePosition(data []byte) (RelativePosition, error)
+    DecodeRelativePosition parses bytes produced by EncodeRelativePosition.
+
+type SharedType = sharedType
+    SharedType is the public interface satisfied by every exported CRDT
+    type (YArray, YMap, YText, YXmlFragment, …). It exists so external
+    callers can name the element type of NewUndoManager's scope slice
+    (`[]crdt.SharedType{txt, arr}`). Its methods are unexported, so only
+    ygo's own types can satisfy it — external code can pass and hold values,
+    but not implement it. It is a type alias for the internal sharedType,
+    so existing in-package call sites are unaffected.
+
+type Snapshot struct {
+	StateVector StateVector
+	DeleteSet   DeleteSet
+}
+    Snapshot captures the state of a Yjs document at a specific moment in time.
+    It records which items existed (StateVector) and which were deleted
+    (DeleteSet) at that moment. Snapshots can be used to restore documents to a
+    past state or to compute what has changed between two points in time.
+
+func CaptureSnapshot(doc *Doc) *Snapshot
+    CaptureSnapshot takes a snapshot of doc's current state.
+
+func DecodeSnapshot(data []byte) (*Snapshot, error)
+    DecodeSnapshot parses bytes produced by EncodeSnapshot (or
+    Y.encodeSnapshot): delete set first, then the state vector, both inline (no
+    length prefixes).
+
+type StackItem struct {
+
+	// Meta holds arbitrary user data attached to this stack item.
+	// Useful for storing cursor positions, selection ranges, etc.
+	// around the undo boundary.
+	Meta map[string]any
+	// Has unexported fields.
+}
+    StackItem represents one reversible unit on the undo or redo stack.
+    It captures what was inserted and what was deleted by a set of consecutive
+    local transactions so that Undo / Redo can invert those changes.
+
+type StateVector map[ClientID]uint64
+    StateVector maps each known ClientID to the highest Clock that has been
+    integrated from that client. Everything up to and including that clock is
+    known; everything above it is missing.
+
+func DecodeStateVectorV1(data []byte) (StateVector, error)
+    DecodeStateVectorV1 parses a blob produced by EncodeStateVectorV1.
+
+func (sv StateVector) Clock(client ClientID) uint64
+    Clock returns the highest integrated clock for a client, or 0 if unknown.
+
+func (sv StateVector) Clone() StateVector
+    Clone returns a deep copy.
+
+func (sv StateVector) Has(id ID) bool
+    Has reports whether the given ID has already been integrated.
+
+type StructStore struct {
+	// Has unexported fields.
+}
+    StructStore holds all Items across all clients in the document. Items for
+    each client are stored in a slice sorted by Clock (append-only). This
+    structure enables O(log n) lookup by ID via binary search and O(1) append.
+
+func (s *StructStore) Append(item *Item)
+    Append adds item to the store. Items must be appended in Clock order per
+    client.
+
+func (s *StructStore) Find(id ID) *Item
+    Find returns the Item that contains the given ID, or nil if not found.
+    An item with Clock c and length l contains IDs with clocks [c, c+l).
+
+    The binary search uses only the start Clock (a plain integer comparison) to
+    avoid calling Content.Len() — which requires a utf8.RuneCountInString scan
+    — inside the hot O(log n) predicate. A single Content.Len() call after the
+    search verifies that id.Clock falls within the candidate item's range.
+
+func (s *StructStore) IterateFrom(sv StateVector, fn func(*Item))
+    IterateFrom calls fn for every Item whose ID is not yet in sv, visiting
+    items in client order, then clock order.
+
+func (s *StructStore) NextClock(client ClientID) uint64
+    NextClock returns the next available clock value for the given client.
+
+func (s *StructStore) StateVector() StateVector
+    StateVector computes the current state vector: for each client, the clock of
+    the last item + its length (i.e. the next expected clock from that client).
+
+type SubdocsEvent struct {
+	Added   []*Doc
+	Removed []*Doc
+	Loaded  []*Doc
+}
+    SubdocsEvent reports subdocument lifecycle changes for one transaction.
+    The slices are freshly allocated per fire; do not retain or mutate them.
+
+type Transaction struct {
+	Origin any  // user-supplied tag forwarded to update observers
+	Local  bool // true when the change originated on this peer; false while applying a remote update
+
+	// Has unexported fields.
+}
+    Transaction batches a set of insertions and deletions into a single atomic
+    operation. Observers fire once per transaction, not once per operation,
+    which keeps event handler overhead proportional to transactions not edits.
+
+func (t *Transaction) Ctx() context.Context
+    Ctx returns the context associated with this transaction. Transactions
+    started via Transact return context.Background(); transactions started
+    via TransactContext return the caller's ctx. fn can poll Ctx().Err() or
+    <-Ctx().Done() to detect cancellation and return early.
+
+    Returning early from fn commits whatever mutations have been made so far —
+    there is no rollback. Callers needing atomicity should recover and reconcile
+    via sync or recreate the doc from persistence.
+
+func (t *Transaction) GetArray(name string) *YArray
+    GetArray returns the named root YArray, creating it if it does not exist.
+    Safe to call inside the Transact callback; see the section comment above.
+
+func (t *Transaction) GetMap(name string) *YMap
+    GetMap returns the named root YMap, creating it if it does not exist.
+    Safe to call inside the Transact callback; see the section comment above.
+
+func (t *Transaction) GetText(name string) *YText
+    GetText returns the named root YText, creating it if it does not exist.
+    Safe to call inside the Transact callback; see the section comment above.
+
+func (t *Transaction) GetXmlFragment(name string) *YXmlFragment
+    GetXmlFragment returns the named root YXmlFragment, creating it if it does
+    not exist. Safe to call inside the Transact callback; see the section
+    comment above.
+
+type UndoManager struct {
+	// Has unexported fields.
+}
+    UndoManager tracks local transactions on one or more shared types and
+    provides Undo / Redo operations. Only transactions originating on this
+    peer (txn.Local == true) are captured; applied remote updates are ignored
+    whatever their origin. (Yjs gates on trackedOrigins alone.) With the default
+    tracked origins it does capture the local, nil-origin transaction that
+    cleans up format markers after a remote edit to formatted text, as Yjs's
+    UndoManager does.
+
+    Undo inverts the most recent captured change: insertions are deleted and
+    deletions are restored. Redo re-applies the most recently undone change.
+
+    Call Destroy when the UndoManager is no longer needed to stop tracking and
+    release the subscription held on the document.
+
+    Note: UndoManager cannot restore items whose content has been freed by
+    RunGC. If you need full undo history, either disable GC (WithGC(false)) or
+    avoid calling RunGC while the UndoManager is active.
+
+func NewUndoManager(doc *Doc, scope []SharedType, opts ...UndoManagerOption) *UndoManager
+    NewUndoManager creates an UndoManager that tracks the listed shared types.
+    scope must not be empty. Multiple types can be tracked simultaneously;
+    any local transaction that touches a scope type, or a type nested in one,
+    is captured.
+
+func (u *UndoManager) Clear()
+    Clear discards all items from both stacks without applying them.
+
+func (u *UndoManager) Destroy()
+    Destroy stops tracking transactions and releases the document subscription.
+    After Destroy, Undo and Redo are no-ops.
+
+    Destroy also re-enables transaction-commit auto-GC (#78 H1) when no other
+    UndoManager remains attached to the doc.
+
+func (u *UndoManager) OnStackItemAdded(fn func(*StackItem, bool))
+    OnStackItemAdded registers fn to be called whenever a new StackItem is
+    pushed onto the undo stack (isRedo=false) or the redo stack (isRedo=true).
+    Use this to attach cursor metadata (e.g. selection before/after) to each
+    stack item via item.Meta.
+
+func (u *UndoManager) Redo() bool
+    Redo re-applies the most recently undone change, skipping no-op stack items
+    like Undo. Returns true if a change was applied; false if the redo stack ran
+    out first.
+
+func (u *UndoManager) RedoContext(ctx context.Context) (bool, error)
+    RedoContext is the context-aware variant of Redo. See UndoContext for the
+    ctx semantics.
+
+func (u *UndoManager) RedoStackSize() int
+    RedoStackSize returns the number of items currently on the redo stack.
+
+func (u *UndoManager) StopCapturing()
+    StopCapturing prevents the next transaction from being merged with the
+    current top of the undo stack, forcing it to become a new stack item.
+    Call this to create an explicit undo boundary between two operations that
+    would otherwise be grouped by the capture timeout.
+
+func (u *UndoManager) Undo() bool
+    Undo inverts the most recently captured local change. Stack items that no
+    longer change anything (e.g. their insertions were already deleted) are
+    discarded and the next one is tried, as in Yjs. Returns true if a change was
+    applied; false if the undo stack ran out first.
+
+func (u *UndoManager) UndoContext(ctx context.Context) (bool, error)
+    UndoContext is the context-aware variant of Undo. If ctx is already
+    cancelled, the undo is NOT attempted, false is returned, and ctx.Err() is
+    the second return value. Otherwise the undo proceeds and the result (whether
+    anything was undone) is returned with nil error.
+
+    Like TransactContext, mid-call ctx cancellation is cooperative; this only
+    guards the entry point.
+
+func (u *UndoManager) UndoStackSize() int
+    UndoStackSize returns the number of items currently on the undo stack.
+
+type UndoManagerOption func(*UndoManager)
+    UndoManagerOption configures an UndoManager at creation time.
+
+func WithCaptureTimeout(d time.Duration) UndoManagerOption
+    WithCaptureTimeout sets the window within which consecutive local
+    transactions are merged into a single undo stack item. The default is 500
+    ms, which matches the Yjs reference implementation.
+
+func WithTrackedOrigins(origins ...any) UndoManagerOption
+    WithTrackedOrigins restricts the UndoManager to only capture transactions
+    whose Origin matches one of the provided values. By default (no option set)
+    all local transactions are captured regardless of origin. Applied remote
+    updates (txn.Local == false) are never captured, even with a tracked origin.
+
+    This is useful for multi-user documents where each user has a distinct
+    origin tag and should only be able to undo their own changes.
+
+    Matching is Go interface equality (==), so origin values must be
+    DISTINGUISHABLE under ==. Values that compare equal are one origin,
+    not two — most surprisingly for pointers to zero-size types: Go satisfies
+    every zero-size allocation from one address (runtime.zerobase), so
+
+        a := new(struct{})
+        b := new(struct{})
+        // a == b — both may point at runtime.zerobase
+
+    two "unique" tokens minted that way alias, and tracking one silently
+    captures the other's transactions too. This exact aliasing once disabled
+    relay publishing inside provider/websocket for six releases (#203, and see
+    relayOriginSentinel's doc in that package). Because the library cannot make
+    caller-supplied values distinct after the fact, WithTrackedOrigins PANICS
+    when given a pointer to a zero-size type.
+
+    Safe token shapes:
+      - a pointer to a NON-zero-size type — e.g. type token struct{ _ byte };
+        &token{} — every allocation is a distinct origin;
+      - distinct named types compared by value — originA{} and originB{} never
+        alias each other (interface equality compares the dynamic type first),
+        though every originA{} is the same origin as every other;
+      - ordinary comparable values (strings, ints) with the usual value
+        semantics: "alice" from anywhere is the origin "alice".
+
+type YArray struct {
+	// Has unexported fields.
+}
+    YArray is a shared ordered list that supports arbitrary-type elements.
+    It embeds abstractType, which owns the underlying doubly-linked Item list.
+
+func NewArrayPrelim() *YArray
+    NewArrayPrelim returns a DETACHED YArray. Content is staged until attached.
+
+func (a *YArray) Delete(txn *Transaction, index, length int)
+    Delete removes length elements starting at logical position index.
+
+func (a *YArray) ForEach(fn func(index int, value any))
+    ForEach calls fn for every non-deleted element in index order. Must not be
+    called from inside a Transact callback.
+
+func (a *YArray) Get(index int) any
+    Get returns the element at logical position index, or nil if out of bounds.
+    Must not be called from inside a Transact callback — acquires a read lock
+    that would deadlock with the write lock held by Transact.
+
+func (a *YArray) Insert(txn *Transaction, index int, vals []any)
+    Insert inserts vals at logical position index (0 = prepend, Len() = append).
+
+func (a *YArray) InsertType(txn *Transaction, index int, st sharedType)
+    InsertType inserts a DETACHED shared type at logical position index (0 =
+    prepend, Len() = append), as its own nested item.
+
+    It is to Insert what PushType is to Push: Insert batches plain values into a
+    single ContentAny item, which a nested type cannot share. Without this, the
+    only way to place a nested type anywhere but the end is PushType followed
+    by Move — and Move emits ContentMove, a ygo extension other implementations
+    mis-parse, usually silently (#207).
+
+    A shared type attaches once: InsertType panics if st is already attached,
+    already staged on this array, or staged on any other container (#222), and
+    if st is the receiver itself or holds it in its staged content (a cycle).
+
+    Placement mirrors Insert: leftNeighbourAt uses LIVE-index semantics (it
+    skips tombstones), splitting the neighbour when the index falls inside it,
+    and an unresolvable index anchors at the tail. The clamp is ygo's Insert
+    rule, not Yjs's — Yjs itself throws ("Length exceeded!") past the live
+    length and on a negative index, where every ygo array mutator clamps.
+    PushType differs deliberately: it anchors after the last PHYSICAL item,
+    tombstones included, so a concurrent Yjs push converges the same way.
+
+func (a *YArray) Len() int
+    Len returns the number of non-deleted elements.
+
+func (a *YArray) Move(txn *Transaction, fromIndex, toIndex int)
+    Move relocates the element at fromIndex to toIndex in a CRDT-safe manner.
+    Both indices are in terms of the logical (non-deleted) rendered position.
+
+    Unlike the previous delete-then-insert implementation, Move now creates
+    a ContentMove item at the destination position in the linked list.
+    The original item remains in place (marked as moved via its MovedBy field)
+    and is rendered at the ContentMove's position instead. This preserves causal
+    history and converges correctly under concurrent edits:
+
+      - Two peers moving DIFFERENT elements: both moves apply, each element ends
+        up at its respective destination.
+      - Two peers moving THE SAME element: the ContentMove with the lower
+        ClientID wins; the element appears at the winner's destination.
+      - One peer moving an element again: its latest move wins, and undoing it
+        returns the element to the previous move's destination.
+
+    physPos formula: after splitting the target element into its own item,
+    the ContentMove is placed at physical position toIndex+1 when fromIndex <
+    toIndex (the target is still physically present and countable before being
+    marked moved), or at toIndex when fromIndex > toIndex.
+
+    Move walks the linked list directly rather than calling Get() to avoid the
+    deadlock that would occur if RLock were acquired on top of the write lock
+    held by the enclosing Transact callback.
+
+func (a *YArray) Observe(fn func(YArrayEvent)) func()
+    Observe registers fn to be called after every transaction that modifies this
+    array. Returns an unsubscribe function. Uses ID-based lookup so out-of-order
+    unsubscription removes the correct entry (C5).
+
+    Acquiring doc.mu.Lock() serialises registration against Transact, which
+    reads the observer slice under the same lock (N-C1). Do not call Observe
+    from inside a Transact callback — that would deadlock.
+
+func (a *YArray) ObserveDeep(fn func(*Transaction)) func()
+    ObserveDeep registers fn to be called after any transaction that modifies
+    this array or any nested shared type within it. Returns an unsubscribe
+    function.
+
+func (a *YArray) Push(txn *Transaction, vals []any)
+    Push appends vals to the end of the array, matching Yjs's push
+    (typeListPushGenerics): the new element anchors after the last PHYSICAL
+    item, tombstones included — NOT after the last live element. Insert(Len())
+    would use live-index semantics (leftNeighbourAt skips tombstones), so when
+    the tail is a tombstone it anchors the new item before it (origin=nil,
+    rightOrigin=tombstone) whereas Yjs anchors after it (origin=tombstone,
+    rightOrigin=nil). Those are different YATA anchors, so a concurrent push
+    from a Yjs peer would order the two results differently — a convergence
+    divergence surfaced by the #70 cross-impl fuzz oracle.
+
+func (a *YArray) PushType(txn *Transaction, st sharedType)
+    PushType appends a DETACHED shared type to the array as its own nested item.
+    Plain values go through Push, which batches them into one ContentAny item;
+    a nested type must occupy an item of its own, hence the separate entry point
+    (the same reason YXmlFragment exposes InsertElement/InsertText).
+
+    A shared type attaches once: PushType panics if st is already attached,
+    already staged on this array, or staged on any other container (#222).
+    Deleting it from its staging container first makes it stageable again. It
+    also panics if st is the receiver itself or holds it in its staged content
+    (a cycle).
+
+    Placement mirrors Push: anchor after the last PHYSICAL item, tombstones
+    included, matching Yjs's typeListPushGenerics.
+
+func (a *YArray) Slice(start, end int) []any
+    Slice returns elements in the half-open range [start, end). Clamps end
+    to Len() if it exceeds the array length. Must not be called from inside a
+    Transact callback.
+
+func (a *YArray) ToJSON() ([]byte, error)
+    ToJSON returns the array serialised as a JSON array: the bytes
+    json.Marshal(a.ToSlice()) would produce, without recursing once per nested
+    shared type. Values are copied out under the document's read lock and
+    formatted after it is released, so a MarshalJSON method may read or write
+    the document. Must not be called from inside a Transact callback.
+
+func (a *YArray) ToSlice() []any
+    ToSlice returns all non-deleted elements as a new slice. Nested shared
+    types are iteratively unwrapped via toJSONValue (#75): a nested YArray
+    appears as []any, a nested YMap as map[string]any, a nested YText as string.
+    Pre-fix these were silently dropped from the output.
+
+    Must not be called from inside a Transact callback.
+
+type YArrayEvent struct {
+	Target *YArray
+	Txn    *Transaction
+	Delta  []Delta
+}
+    YArrayEvent is emitted after a transaction that modifies a YArray.
+
+    Delta is a Quill-compatible changeset describing the array modifications:
+    a sequence of Insert(values), Retain(n), and Delete(n) ops. Inserts carry
+    Insert as a []any of newly-added values. Added in v1.15.0 (#74 vector D1) to
+    match Yjs JS's `ArrayEvent.delta` and yrs's `ArrayEvent::delta`.
+
+type YMap struct {
+	// Has unexported fields.
+}
+    YMap is a shared key-value store with last-write-wins semantics.
+    It embeds abstractType, which owns the underlying doubly-linked Item list.
+    Every key maps to at most one live Item; concurrent writes to the same key
+    are resolved deterministically: the item with the higher ClientID wins.
+
+func NewMapPrelim() *YMap
+    NewMapPrelim returns a DETACHED YMap. Entries are staged until attached.
+
+func (m *YMap) Delete(txn *Transaction, key string)
+    Delete removes the entry for key if it exists.
+
+func (m *YMap) Entries() map[string]any
+    Entries returns a snapshot of all live key-value pairs. Nested shared
+    types are iteratively unwrapped (#75): nested YArray → []any, nested YMap →
+    map[string]any, nested YText → string. Pre-fix these were silently dropped
+    from the output.
+
+    Must not be called from inside a Transact callback.
+
+func (m *YMap) ForEach(fn func(key string, value any))
+    ForEach calls fn for every live (non-deleted) key-value pair in the map,
+    in an unspecified order. Must not be called from inside a Transact callback.
+
+func (m *YMap) Get(key string) (any, bool)
+    Get returns the value for key and whether the key exists. Must not be called
+    from inside a Transact callback.
+
+func (m *YMap) Has(key string) bool
+    Has reports whether key has a live (non-deleted) entry. Must not be called
+    from inside a Transact callback.
+
+func (m *YMap) Keys() []string
+    Keys returns all keys with live entries. Must not be called from inside a
+    Transact callback.
+
+func (m *YMap) Observe(fn func(YMapEvent)) func()
+    Observe registers fn to be called after every transaction that modifies this
+    map. Returns an unsubscribe function. Uses ID-based lookup so out-of-order
+    unsubscription removes the correct entry (C5).
+
+    Acquiring doc.mu.Lock() serialises registration against Transact (N-C1).
+    Do not call Observe from inside a Transact callback — that would deadlock.
+
+func (m *YMap) ObserveDeep(fn func(*Transaction)) func()
+    ObserveDeep registers fn to be called after any transaction that modifies
+    this map or any nested shared type within it. Returns an unsubscribe
+    function.
+
+func (m *YMap) Set(txn *Transaction, key string, value any)
+    Set writes value under key. If a live entry already exists for key, it is
+    deleted and the new item becomes the winner.
+
+    A DETACHED shared type passed as value is staged (or attached, if this map
+    is live) as a nested type. A shared type attaches once: Set panics if the
+    value is already attached, staged under another key of this map, or staged
+    on any other container (#222), and if it is m itself or holds m in its
+    staged content (a cycle). Overwriting or deleting a staged entry releases
+    its handle, making it stageable elsewhere.
+
+func (m *YMap) ToJSON() ([]byte, error)
+    ToJSON returns the map serialised as a JSON object with sorted keys: the
+    bytes json.Marshal(m.Entries()) would produce, without recursing once per
+    nested shared type. Values are copied out under the document's read lock and
+    formatted after it is released, so a MarshalJSON method may read or write
+    the document. Must not be called from inside a Transact callback.
+
+type YMapEvent struct {
+	Target      *YMap
+	Txn         *Transaction
+	KeysChanged map[string]struct{}
+	Keys        map[string]KeyChange
+}
+    YMapEvent is emitted after a transaction that modifies a YMap.
+
+    KeysChanged is the legacy field — a set of every map key touched during the
+    transaction. Kept for backward compatibility.
+
+    Keys is the structured replacement (added in v1.15.0, #74 vector D2):
+    per-key Action + OldValue, enabling undo/redo, replication consumers,
+    and audit-log integrations to reconstruct the pre-transaction state from the
+    event alone.
+
+type YText struct {
+	// Has unexported fields.
+}
+    YText is a shared rich-text type. Characters are stored as ContentString
+    items; formatting spans are ContentFormat items (which do not count toward
+    logical length).
+
+func NewTextPrelim() *YText
+    NewTextPrelim returns a DETACHED YText. Mutations are buffered until it is
+    attached (via YMap.Set or YArray.PushType) and replayed then, so its items
+    get clocks above the container item's — the ordering genuine Yjs produces.
+
+func (txt *YText) ApplyDelta(txn *Transaction, delta []Delta)
+    ApplyDelta applies a Quill-compatible delta to the text within the given
+    transaction. Each Delta must have exactly one of Op set:
+      - DeltaOpInsert: inserts d.Insert at the current cursor position with
+        optional d.Attributes; a string is text, any other non-nil value an
+        embed, as InsertEmbed takes it
+      - DeltaOpDelete: deletes d.Delete UTF-16 code units at the current cursor
+        position
+      - DeltaOpRetain: advances the cursor by d.Retain UTF-16 code units;
+        if d.Attributes is non-nil, applies formatting to the retained range
+
+    The cursor starts at position 0. ApplyDelta must be called from inside a
+    Transact callback.
+
+func (txt *YText) Delete(txn *Transaction, index, length int)
+    Delete removes length characters starting at logical position index.
+
+    After the range is tombstoned, Delete examines ContentFormat markers in the
+    local deletion region and tombstones any that no longer wrap live content —
+    matching Yjs JS's cleanupFormattingGap. Without this, repeated edits leave
+    orphan markers that bloat the store and inflate the encoded delete-set.
+    See #71 vector A4.
+
+    The scan is gated on txt.hasFormatting: YText that has never had a
+    ContentFormat integrated (the common plain-text case) skips the walk
+    entirely. This mirrors Yjs's `_hasFormatting` flag gating and is the
+    dominant perf win on head-delete workloads in plain-text documents (#86).
+
+    When the scan does run it is scoped to the region between the item just
+    before the deletion and the first live countable item after it, so the
+    per-Delete cost is O(region size + scope size of any markers found) rather
+    than O(document).
+
+func (txt *YText) Format(txn *Transaction, index, length int, attrs Attributes)
+    Format applies attrs to the character range [index, index+length).
+
+    For each attribute being set (non-nil value) two ContentFormat items
+    are inserted: an opening marker at index and a closing nil marker at
+    index+length. This bounds the formatting to the requested range so that text
+    inserted after the range is not implicitly formatted.
+
+    For attribute removal (nil value) only the opening nil marker is inserted.
+    The removal marker overrides any preceding non-nil marker for the same key
+    when the document state is read left-to-right by ToDelta.
+
+    Note: removal of an attribute whose source marker was inserted by a
+    concurrent peer may not produce the intended result because YATA places the
+    removal marker before the source marker when both share the same origin.
+    Full concurrent attribute removal is tracked as a follow-up improvement.
+
+func (txt *YText) Insert(txn *Transaction, index int, text string, attrs Attributes)
+    Insert inserts text at logical character position index.
+
+    Attribute semantics match Yjs's YText.insert:
+
+      - When attrs is nil or empty, the new text inherits the formatting in
+        effect at the cursor: typing at the end of bold text stays bold.
+        (Yjs inherits only when the attributes argument is omitted; an explicit
+        {} there clears every attribute.)
+
+      - When attrs is non-empty, the text carries exactly attrs: every attribute
+        in effect at the cursor that attrs does not name is cleared for the
+        insert, and closing markers restore the surrounding formatting after it.
+
+func (txt *YText) InsertEmbed(txn *Transaction, index int, embed any, attrs Attributes)
+    InsertEmbed inserts an embedded object (image, formula, video metadata,
+    or any other inline non-text payload) at logical UTF-16 position index.
+    Each embed counts as one UTF-16 code unit in the document's length, matching
+    Yjs JS's `YText.insertEmbed` semantics.
+
+    The embed carries exactly attrs, as in Yjs: every attribute in effect at
+    the cursor that attrs does not name is cleared for it, so an embed inside
+    bold text is not bold unless attrs says so. Pass nil for an unstyled embed.
+    Like attribute values, embed is stored in the form V1 and V2 both encode
+    (see Attributes) and InsertEmbed panics on a value with none, such as a
+    shared type (YMap, YText, ...).
+
+    Must be called from inside a Transact callback.
+
+    Added in v1.12.0 (#76).
+
+func (txt *YText) Len() int
+    Len returns the number of non-deleted UTF-16 code units (not Unicode code
+    points). Supplementary characters (U+10000 and above) count as 2 units,
+    matching JavaScript's String.length semantics and the Yjs wire protocol.
+
+func (txt *YText) Observe(fn func(YTextEvent)) func()
+    Observe registers fn to be called after every transaction that modifies this
+    text. Returns an unsubscribe function. Uses ID-based lookup so out-of-order
+    unsubscription removes the correct entry (C5).
+
+    Acquiring doc.mu.Lock() serialises registration against Transact (N-C1).
+    Do not call Observe from inside a Transact callback — that would deadlock.
+
+func (txt *YText) ObserveDeep(fn func(*Transaction)) func()
+    ObserveDeep registers fn to be called after any transaction that modifies
+    this text or any nested shared type within it. Returns an unsubscribe
+    function.
+
+func (txt *YText) ToDelta() []Delta
+    ToDelta returns a Quill-compatible delta representing the current document
+    state as a sequence of insert operations.
+
+    Each run of plain text becomes one Delta with Op=DeltaOpInsert. Formatting
+    attributes accumulated from ContentFormat markers are attached to the text
+    run they precede. A nil attribute value signals the end of a span and is
+    omitted from the output attributes map. Must not be called from inside a
+    Transact callback.
+
+func (txt *YText) ToJSON() ([]byte, error)
+    ToJSON returns the text content serialised as a JSON string. Must not be
+    called from inside a Transact callback.
+
+func (txt *YText) ToString() string
+    ToString returns the concatenation of all non-deleted character runs,
+    excluding format markers. Must not be called from inside a Transact
+    callback.
+
+type YTextEvent struct {
+	Target *YText
+	Txn    *Transaction
+	Delta  []Delta
+}
+    YTextEvent is emitted after a transaction that modifies a YText.
+
+type YXmlElement struct {
+	YXmlFragment
+	NodeName string
+
+	// Has unexported fields.
+}
+    YXmlElement is an XML element: a named tag with optional attributes and
+    ordered child nodes. It embeds YXmlFragment for child management.
+
+    Attributes are stored as map-keyed items (ParentSub = attribute name) in the
+    same abstractType as children. Children are ContentType items with ParentSub
+    = "".
+
+func NewYXmlElement(nodeName string) *YXmlElement
+    NewYXmlElement creates a standalone YXmlElement ready to be inserted into a
+    YXmlFragment or another YXmlElement.
+
+func (e *YXmlElement) DeleteAttribute(txn *Transaction, key string)
+    DeleteAttribute removes the attribute with the given key if it exists.
+
+func (e *YXmlElement) GetAttribute(key string) (string, bool)
+    GetAttribute returns the value of attribute key rendered as a string, and
+    whether the attribute is present. Non-string scalar values (numbers, bools
+    — e.g. a ProseMirror heading's level=1) get a best-effort string rendering;
+    use GetAttributeValue for the exact typed value. Previously non-string
+    values were silently dropped, which lost y-prosemirror heading levels on the
+    JS→Go path. (#yxml-wire)
+
+func (e *YXmlElement) GetAttributeValue(key string) (any, bool)
+    GetAttributeValue returns the typed value of attribute key (string, int64,
+    float64, bool, … — whatever the CRDT holds) and whether it is present. On a
+    DETACHED element it reads the buffered prelim attribute, already normalised
+    to its wire type, so the result is identical before and after attach.
+
+func (e *YXmlElement) GetAttributeValues() map[string]any
+    GetAttributeValues returns all live attributes with their typed values,
+    mirroring Yjs's YXmlElement.getAttributes(). A DETACHED element returns its
+    buffered prelim attributes (normalised to their wire types). Note this is
+    intentionally MORE complete than yjs, whose getAttribute does not surface
+    _prelimAttrs until integrate — ygo keeps detached reads consistent with the
+    attached view. Wire bytes are unaffected. (#yxml-wire)
+
+func (e *YXmlElement) GetAttributes() map[string]string
+    GetAttributes returns all live attributes as a string-keyed map. Non-string
+    scalar values get a best-effort string rendering; use GetAttributeValues for
+    the exact typed values. (#yxml-wire)
+
+func (e *YXmlElement) InsertElement(txn *Transaction, index int, elem *YXmlElement)
+    InsertElement inserts a YXmlElement at child position index.
+
+func (e *YXmlElement) InsertText(txn *Transaction, index int, txt *YXmlText)
+    InsertText inserts a YXmlText at child position index.
+
+func (e *YXmlElement) Observe(fn func(YXmlEvent)) func()
+    Observe registers fn to be called after every transaction that modifies
+    this element (children added/removed or attributes changed). Returns an
+    unsubscribe function. Uses ID-based lookup so out-of-order unsubscription
+    removes the correct entry (C5).
+
+    Acquiring doc.mu.Lock() serialises registration against Transact (N-C1).
+    Do not call Observe from inside a Transact callback — that would deadlock.
+
+func (e *YXmlElement) SetAttribute(txn *Transaction, key, value string)
+    SetAttribute sets the XML attribute key to a string value. For non-string
+    values (numbers, booleans — e.g. a ProseMirror heading's level) use
+    SetAttributeValue; Yjs stores attribute values typed, and y-prosemirror
+    round-trips them typed.
+
+func (e *YXmlElement) SetAttributeValue(txn *Transaction, key string, value any)
+    SetAttributeValue sets the XML attribute key to an arbitrary scalar value
+    (string, number, bool, …), preserving the value type on the wire exactly as
+    Yjs's YXmlElement.setAttribute does.
+
+func (e *YXmlElement) ToXML() string
+    ToXML serialises the element as <NodeName attrs>children</NodeName>.
+    Attribute keys are sorted alphabetically for deterministic output.
+
+type YXmlEvent struct {
+	Target      interface{}
+	Txn         *Transaction
+	KeysChanged map[string]struct{}
+}
+    YXmlEvent is emitted after a transaction that modifies a YXmlFragment,
+    YXmlElement, or YXmlText node. Target holds the concrete type
+    (*YXmlFragment, *YXmlElement, or *YXmlText). KeysChanged contains attribute
+    keys that were added, updated, or deleted during the transaction; it is nil
+    for child-only modifications.
+
+type YXmlFragment struct {
+	// Has unexported fields.
+}
+    YXmlFragment is an ordered container of XML child nodes. It is the base type
+    for YXmlElement and can also be used directly as a root XML type.
+
+func (f *YXmlFragment) Children() []xmlNode
+    Children returns all non-deleted child XML nodes in document order.
+    A DETACHED fragment/element returns a copy of its buffered prelim children
+    (the same node values that were inserted), so iteration and ToXML reflect
+    the subtree before it attaches. (#yxml-wire)
+
+func (f *YXmlFragment) Delete(txn *Transaction, index, length int)
+    Delete removes length child nodes starting at child position index.
+    On a detached fragment/element it splices the buffered prelim children,
+    exactly like Yjs's YXmlFragment.delete on _prelimContent.
+
+func (f *YXmlFragment) Insert(txn *Transaction, index int, nodes ...xmlNode)
+    Insert inserts XML nodes at child position index (0 = prepend).
+
+    While the fragment/element is detached the nodes are only buffered
+    (prelimChildren) and materialised when the subtree attaches — see
+    prelimFlusher. (#yxml-wire)
+
+    A node attaches once: Insert panics if a node is already attached, staged
+    on any parent, or passed twice, and if it is f itself or buffers f in its
+    subtree (a cycle). Deleting a buffered node from its detached parent makes
+    it stageable again.
+
+func (f *YXmlFragment) InsertElement(txn *Transaction, index int, elem *YXmlElement)
+    InsertElement inserts a YXmlElement at child position index. This is the
+    exported convenience wrapper for Insert — use it when inserting XML elements
+    from outside the crdt package.
+
+func (f *YXmlFragment) InsertText(txn *Transaction, index int, txt *YXmlText)
+    InsertText inserts a YXmlText at child position index. This is the exported
+    convenience wrapper for Insert — use it when inserting XML text nodes from
+    outside the crdt package.
+
+func (f *YXmlFragment) Len() int
+    Len returns the number of non-deleted child nodes (attributes are excluded).
+
+    A DETACHED fragment/element reports its buffered prelim child count,
+    matching yjs's _prelimContent-aware length. This keeps index math consistent
+    across attach — in particular Insert(txn, Len(), node) appends rather than
+    prepending. (Nested TEXT content stays opaque until attach: a detached
+    YXmlText reports Len 0, mirroring yjs — see YText.) (#yxml-wire)
+
+func (f *YXmlFragment) Observe(fn func(YXmlEvent)) func()
+    Observe registers fn to be called after every transaction that modifies
+    this fragment. Returns an unsubscribe function. Uses ID-based lookup so
+    out-of-order unsubscription removes the correct entry (C5).
+
+    Acquiring doc.mu.Lock() serialises registration against Transact (N-C1).
+    Do not call Observe from inside a Transact callback — that would deadlock.
+
+func (f *YXmlFragment) ToXML() string
+    ToXML returns the XML serialisation of this fragment's children
+    concatenated.
+
+type YXmlText struct {
+	YText
+}
+    YXmlText is a text node inside an XML tree. It embeds YText, inheriting all
+    text-editing methods (Insert, Delete, Format, ToString, Observe).
+
+func NewYXmlText() *YXmlText
+    NewYXmlText creates a standalone YXmlText ready to be inserted into a
+    YXmlFragment or YXmlElement.
+
+func (t *YXmlText) ToXML() string
+    ToXML returns the text content with XML-special characters escaped.
+

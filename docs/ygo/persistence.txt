@@ -1,0 +1,565 @@
+package persistence // import "github.com/reearth/ygo/persistence"
+
+Package persistence provides a versioned, append-only store for ygo CRDT
+documents, keyed by room name. Each committed transaction's incremental V1
+update is appended as a distinct Version; the head state can be loaded, rebuilt
+at any past version, snapshotted by name, and pruned.
+
+# Internal format
+
+Everything is stored in lib0 V1 (the format produced by
+crdt.EncodeStateAsUpdateV1 and consumed by crdt.ApplyUpdateV1). V1 is the only
+format ygo can merge (crdt.MergeUpdatesV1 has no V2 sibling). Callers that need
+V2 at the edge convert with crdt.UpdateV1ToV2 / UpdateV2ToV1.
+
+# Versions
+
+A Version is a per-room sequence number assigned by AppendUpdate, starting at 1.
+Within an unbroken history versions are dense and increasing; PruneAfter resets
+the head to its target and subsequent appends continue at target+1, so version
+numbers above a pruned point are superseded and reused for the new history.
+Named snapshots carry their own captured version independently. ListVersions
+returns the single (non-cumulative) updates newest-first; MaterializeAt folds
+the updates up to and including a version into a head state via MergeUpdatesV1.
+
+# Crash safety
+
+PruneAfter implements snapshot-before-delete: it first persists a rolled-back
+head plus a checkpoint at the target version, and only then deletes the updates
+newer than the target. A crash between those steps must never resurrect a
+"future" version on reopen — implementations enforce the checkpoint as a hard
+ceiling on the visible version range.
+
+VARIABLES
+
+var ErrEmptySnapshot = errors.New("persistence: empty snapshot state")
+    ErrEmptySnapshot is returned by SaveSnapshot when state is empty: an empty
+    document has no state worth versioning.
+
+var ErrRoomNotFound = errors.New("persistence: room not found")
+    ErrRoomNotFound is returned by operations that require an existing room.
+    Load returns a zero LoadResult (not this error) for an unknown room,
+    matching the provider PersistenceAdapter contract where a missing room is
+    (nil, nil).
+
+var ErrSnapshotNotFound = errors.New("persistence: snapshot not found")
+    ErrSnapshotNotFound is returned by GetSnapshotState when the (room, id) pair
+    does not exist.
+
+var ErrSnapshotsUnsupported = errors.New("persistence: store does not implement SnapshotStore")
+    ErrSnapshotsUnsupported is returned by LegacyAdapter.SaveVersion when the
+    wrapped store does not implement SnapshotStore, so there is nowhere to
+    record a version. It is surfaced rather than ignored: silently discarding
+    versions would look like auto-versioning is working when it is not.
+
+
+FUNCTIONS
+
+func RunConformance(t *testing.T, factory func() VersionedPersistence)
+    RunConformance runs the full VersionedPersistence behavioural suite against
+    a fresh store produced by factory. External adapters import this package
+    and call RunConformance with their own factory to verify conformance.
+    The factory must return an empty store on each call.
+
+func RunRoomListerConformance(t *testing.T, factory func() SnapshotVersionedPersistence)
+    RunRoomListerConformance exercises the RoomLister contract against a
+    backend. factory must return a fresh, empty store per call that implements
+    both VersionedPersistence (to create data) and RoomLister (to enumerate it).
+
+    It lives in the non-test build (like RunConformance) so backends in other
+    packages can call it.
+
+func RunSnapshotStoreConformance(t *testing.T, factory func() SnapshotStore)
+    RunSnapshotStoreConformance exercises the SnapshotStore contract against a
+    backend. factory must return a fresh, empty store per call.
+
+    It lives in the non-test build (like RunConformance) so backends in other
+    packages can call it.
+
+
+TYPES
+
+type CrashInjector interface {
+	// SetCrashAfterCheckpoint installs a hook PruneAfter calls immediately after
+	// writing its checkpoint + rolled-back head but before deleting future
+	// records. Returning true makes PruneAfter return early, leaving stale
+	// future records behind. Pass nil to clear.
+	SetCrashAfterCheckpoint(fn func() bool)
+}
+    CrashInjector is an optional interface a VersionedPersistence implementation
+    may satisfy to let the conformance suite simulate a crash partway through
+    PruneAfter (between the checkpoint write and the deletes). Implementations
+    that cannot simulate this should not implement it; the suite skips the
+    crash-safety subtest for them (and logs a notice).
+
+type FilePersistence struct {
+	// Has unexported fields.
+}
+    FilePersistence is a directory-backed VersionedPersistence. Layout:
+
+        <root>/<roomHex>/updates/<version>.bin     one V1 update per file
+        <root>/<roomHex>/snapshots/<nameHex>.bin   named V1 snapshot
+        <root>/<roomHex>/checkpoint                target version + rolled-back head
+
+    Room and snapshot names are hex-encoded so arbitrary Unicode/space names map
+    to safe filenames. The checkpoint file is the crash-safety pivot: PruneAfter
+    writes it (atomically via temp+rename) before deleting future update files,
+    and every read clamps the visible version range to the checkpoint,
+    so a crash between the checkpoint write and the deletes can never resurrect
+    a future version. Safe for concurrent use via a process-local mutex;
+    it is NOT a multi-process lock.
+
+func NewFilePersistence(dir string) (*FilePersistence, error)
+    NewFilePersistence opens (creating if necessary) a file-backed store rooted
+    at dir.
+
+func (f *FilePersistence) AppendUpdate(ctx context.Context, room string, update []byte) (Version, error)
+    AppendUpdate appends one V1 update.
+
+func (f *FilePersistence) CaptureSnapshot(ctx context.Context, room, name string, state []byte) (Version, error)
+    CaptureSnapshot stores a named V1 snapshot.
+
+func (f *FilePersistence) Compact(ctx context.Context, room string, keep int) (int, error)
+    Compact folds the oldest updates into the oldest retained one.
+
+func (f *FilePersistence) Delete(ctx context.Context, room string) error
+    Delete removes all data for room.
+
+func (f *FilePersistence) DeleteSnapshot(ctx context.Context, room string, id int64) error
+    DeleteSnapshot removes one snapshot. Deleting an unknown snapshot is a
+    no-op.
+
+func (f *FilePersistence) GetSnapshotState(ctx context.Context, room string, id int64) ([]byte, error)
+    GetSnapshotState returns one snapshot's state blob.
+
+func (f *FilePersistence) GetUpdate(ctx context.Context, room string, v Version) ([]byte, VersionMeta, bool, error)
+    GetUpdate returns the single update at v.
+
+func (f *FilePersistence) ListRooms(ctx context.Context) ([]string, error)
+    ListRooms returns every room directory under the root, decoding the on-disk
+    hex names back to the original room names.
+
+func (f *FilePersistence) ListSnapshots(ctx context.Context, room string) ([]SnapshotInfo, error)
+    ListSnapshots returns snapshot metadata newest-first.
+
+func (f *FilePersistence) ListVersions(ctx context.Context, room string) ([]VersionMeta, error)
+    ListVersions returns metadata newest-first.
+
+    Cost: O(n) in the number of stored versions — it does one os.Stat per record
+    to read the modification time. Keep histories bounded with Compact (or
+    PruneAfter) so this stays cheap; an unbounded log makes every ListVersions
+    (and Load/MaterializeAt) linearly slower.
+
+func (f *FilePersistence) Load(ctx context.Context, room string) (LoadResult, error)
+    Load returns the materialized head.
+
+func (f *FilePersistence) MaterializeAt(ctx context.Context, room string, v Version) ([]byte, error)
+    MaterializeAt rebuilds the V1 head at v.
+
+func (f *FilePersistence) PruneAfter(ctx context.Context, room string, target Version, rolledBack []byte) error
+    PruneAfter implements snapshot-before-delete.
+
+func (f *FilePersistence) Reopen() (VersionedPersistence, error)
+    Reopen returns a fresh handle over the same directory, modelling a process
+    restart. Satisfies Reopener for the conformance crash-safety subtest.
+
+func (f *FilePersistence) RestoreSnapshot(ctx context.Context, room, name string) ([]byte, Version, bool, error)
+    RestoreSnapshot returns a named snapshot.
+
+func (f *FilePersistence) SaveSnapshot(ctx context.Context, room, label string, state []byte) (int64, error)
+    SaveSnapshot stores state as a new labelled snapshot and returns its ID.
+
+func (f *FilePersistence) SetCrashAfterCheckpoint(fn func() bool)
+    SetCrashAfterCheckpoint satisfies CrashInjector.
+
+type LegacyAdapter struct {
+
+	// KeepVersions bounds retained history when the websocket server asks the
+	// adapter to compact (see the provider's CompactableAdapter / CompactEvery).
+	// 0 (default) keeps all history — Compact becomes a cheap no-op. Set > 0 to
+	// trim to the newest KeepVersions updates on each compaction. Adapter-side
+	// retention policy; set before serving.
+	KeepVersions int
+
+	// KeepSnapshots bounds retained labelled snapshots PER LABEL when the
+	// websocket server asks the adapter to save a version (see the provider's
+	// VersionableAdapter / AutoVersionEvery). 0 (default) keeps every version,
+	// matching KeepVersions.
+	//
+	// Two things that are not guessable from the name. It is per label, not per
+	// room, so a room's total is unbounded — see TrimSnapshots, which also
+	// applies it on demand. And it is applied only by those two, so snapshots
+	// written straight to SnapshotStore.SaveSnapshot are never trimmed: with
+	// auto-versioning off and no TrimSnapshots call, this field does nothing.
+	//
+	// Retention over VERSIONS (SnapshotStore entries), a different axis from
+	// KeepVersions' retention over the raw update log.
+	KeepSnapshots int
+	// Has unexported fields.
+}
+    LegacyAdapter adapts a VersionedPersistence to the provider/websocket
+    PersistenceAdapter contract (LoadDoc / StoreUpdate), so a versioned store
+    can be passed to websocket.NewServerWithPersistence. It is intentionally
+    defined without importing provider/websocket — the websocket package
+    consumes its PersistenceAdapter dependency structurally, so matching method
+    signatures is sufficient and avoids an import cycle.
+
+    Mapping:
+      - LoadDoc(room) → Load(ctx, room).Update (materialized head)
+      - StoreUpdate(room, upd) → AppendUpdate(ctx, room, upd) (drops the
+        Version)
+
+    The provider calls StoreUpdate once per committed transaction with the
+    incremental V1 update, which is exactly AppendUpdate's contract — so every
+    transaction becomes one persisted Version, giving the version history for
+    free.
+
+func NewLegacyAdapter(store VersionedPersistence) *LegacyAdapter
+    NewLegacyAdapter wraps store. The provider's LoadDoc/StoreUpdate are
+    context-free; the adapter uses context.Background() for the underlying
+    calls. Use NewLegacyAdapterContext to supply a context (e.g. one cancelled
+    on shutdown) so I/O-backed stores can abort in-flight work.
+
+func NewLegacyAdapterContext(ctx context.Context, store VersionedPersistence) *LegacyAdapter
+    NewLegacyAdapterContext is like NewLegacyAdapter but threads ctx through
+    every underlying store call.
+
+func (a *LegacyAdapter) Compact(ctx context.Context, room string) error
+    Compact satisfies the provider's optional CompactableAdapter interface.
+    It forwards to the wrapped VersionedPersistence.Compact with the configured
+    KeepVersions retention (0 = keep all). The deleted count is dropped.
+
+func (a *LegacyAdapter) LoadDoc(room string) ([]byte, error)
+    LoadDoc returns the merged V1 head state for room, or (nil, nil) when empty
+    — matching the PersistenceAdapter contract.
+
+func (a *LegacyAdapter) SaveVersion(ctx context.Context, room, label string) (int64, error)
+    SaveVersion satisfies the provider's optional VersionableAdapter interface.
+    It materializes the room's current head and records it as a labelled
+    snapshot via the wrapped store's SnapshotStore, then applies KeepSnapshots
+    retention.
+
+    An empty room is a no-op returning (0, nil): there is no state worth
+    versioning, and creating an empty version on every idle room would be
+    exactly the history noise auto-versioning exists to avoid.
+
+    Retention failures are deliberately NOT propagated: the version is already
+    durable at that point, and reporting an error would make the provider log
+    a failure for an operation that actually succeeded. A trim that does not
+    happen is retried after the next save.
+
+func (a *LegacyAdapter) Store() VersionedPersistence
+    Store returns the wrapped VersionedPersistence so callers can reach the
+    versioned API (ListVersions, MaterializeAt, snapshots, prune) alongside the
+    legacy provider integration.
+
+func (a *LegacyAdapter) StoreUpdate(room string, update []byte) error
+    StoreUpdate appends one incremental V1 update as a new Version. The assigned
+    version is discarded to satisfy the PersistenceAdapter signature; callers
+    needing the version should use the VersionedPersistence directly.
+
+func (a *LegacyAdapter) StoreUpdateContext(ctx context.Context, room string, update []byte) error
+    StoreUpdateContext satisfies the optional PersistenceAdapterContext
+    extension, threading the supplied ctx through to AppendUpdate so the
+    provider can abort in-flight writes on shutdown.
+
+func (a *LegacyAdapter) TrimSnapshots(ctx context.Context, room, label string) (int, error)
+    TrimSnapshots deletes the oldest snapshots of room labelled label beyond
+    KeepSnapshots, reporting how many it deleted.
+
+    Retention is per label: an auto-version save never evicts a snapshot a
+    user named. The label is a parameter because this package does not import
+    provider/websocket and so cannot know which label means "automatic".
+
+    Returns ErrSnapshotsUnsupported if the store is not a SnapshotStore.
+    That is checked before KeepSnapshots, so retention being disabled cannot
+    mask a misconfigured store. Otherwise KeepSnapshots <= 0 keeps everything
+    and returns (0, nil) — the opposite of some Yjs ports, where keep 0 deletes
+    every version.
+
+    The per-label bound leaves a room's total unbounded at (distinct labels x
+    KeepSnapshots); bounding the total is what evicts named snapshots. For a
+    hard per-room cap, enumerate labels and trim each.
+
+    Every surplus snapshot is attempted even if one delete fails, and the
+    error joins the failures. DeleteSnapshot is contractually idempotent,
+    so a concurrent trim of the same class cannot report a spurious failure.
+
+type LoadResult struct {
+	// Update is the full lib0 V1 head state (suitable for crdt.ApplyUpdateV1).
+	// Empty (nil) for a room that has no stored updates.
+	Update []byte
+	// Version is the highest version folded into Update, or 0 if the room is
+	// empty.
+	Version Version
+}
+    LoadResult is the materialized head state of a room.
+
+type MemoryPersistence struct {
+	// Has unexported fields.
+}
+    MemoryPersistence is an in-memory VersionedPersistence. It is the reference
+    implementation and the simplest target for the conformance suite. Safe for
+    concurrent use.
+
+func NewMemoryPersistence() *MemoryPersistence
+    NewMemoryPersistence returns an empty in-memory store.
+
+func (m *MemoryPersistence) AppendUpdate(ctx context.Context, room string, update []byte) (Version, error)
+    AppendUpdate appends one V1 update and returns its version.
+
+func (m *MemoryPersistence) CaptureSnapshot(ctx context.Context, room, name string, state []byte) (Version, error)
+    CaptureSnapshot stores a named V1 snapshot.
+
+func (m *MemoryPersistence) Compact(ctx context.Context, room string, keep int) (int, error)
+    Compact folds the oldest updates into the oldest retained one, keeping at
+    most keep newest records.
+
+func (m *MemoryPersistence) Delete(ctx context.Context, room string) error
+    Delete removes all data for room.
+
+func (m *MemoryPersistence) DeleteSnapshot(ctx context.Context, room string, id int64) error
+    DeleteSnapshot removes one snapshot. Deleting an unknown snapshot is a
+    no-op.
+
+func (m *MemoryPersistence) GetSnapshotState(ctx context.Context, room string, id int64) ([]byte, error)
+    GetSnapshotState returns one snapshot's state blob.
+
+func (m *MemoryPersistence) GetUpdate(ctx context.Context, room string, v Version) ([]byte, VersionMeta, bool, error)
+    GetUpdate returns the single update at v.
+
+func (m *MemoryPersistence) ListRooms(ctx context.Context) ([]string, error)
+    ListRooms returns every room holding at least one update or snapshot.
+
+func (m *MemoryPersistence) ListSnapshots(ctx context.Context, room string) ([]SnapshotInfo, error)
+    ListSnapshots returns snapshot metadata newest-first.
+
+func (m *MemoryPersistence) ListVersions(ctx context.Context, room string) ([]VersionMeta, error)
+    ListVersions returns metadata newest-first.
+
+func (m *MemoryPersistence) Load(ctx context.Context, room string) (LoadResult, error)
+    Load returns the materialized head state.
+
+func (m *MemoryPersistence) MaterializeAt(ctx context.Context, room string, v Version) ([]byte, error)
+    MaterializeAt rebuilds the V1 head at v.
+
+func (m *MemoryPersistence) PruneAfter(ctx context.Context, room string, target Version, rolledBack []byte) error
+    PruneAfter implements snapshot-before-delete.
+
+    Steps 1 (checkpoint write) and 2 (delete) run in a SINGLE critical section
+    so a concurrent Delete(room) cannot slip in between them — without the
+    single lock, step 2 would mutate a *memRoom already detached from m.rooms
+    and silently lose the prune. The crash-injector hook is invoked while
+    the lock is still held: the conformance suite only needs the crash to be
+    observable AFTER the checkpoint is set and BEFORE the deletes, which is
+    exactly this point. On a simulated crash we return with the checkpoint
+    set but the records still present — readers clamp to the checkpoint
+    (checkpointSet), so the lingering future records stay invisible even across
+    a "reopen".
+
+func (m *MemoryPersistence) RestoreSnapshot(ctx context.Context, room, name string) ([]byte, Version, bool, error)
+    RestoreSnapshot returns a named snapshot.
+
+func (m *MemoryPersistence) SaveSnapshot(ctx context.Context, room, label string, state []byte) (int64, error)
+    SaveSnapshot stores state as a new labelled snapshot and returns its ID.
+
+func (m *MemoryPersistence) SetCrashAfterCheckpoint(fn func() bool)
+    SetCrashAfterCheckpoint satisfies CrashInjector for the conformance suite.
+
+type Reopener interface {
+	Reopen() (VersionedPersistence, error)
+}
+    Reopener is an optional interface a VersionedPersistence may satisfy to
+    model a process restart: it returns a fresh handle over the same backing
+    store. File-backed stores reopen the directory; in-memory stores return
+    themselves (the data already survives within the process). Used by the
+    crash-safety subtest to assert that a crash-left store does not resurrect
+    future versions after "reopen".
+
+type RoomLister interface {
+	ListRooms(ctx context.Context) ([]string, error)
+}
+    RoomLister is the optional room-enumeration extension of
+    VersionedPersistence. A backend that implements it can report which rooms it
+    holds data for, which is what an operator needs in order to run retention,
+    cleanup, migration, or reconciliation across a whole store rather than one
+    room at a time.
+
+    Without it, a caller has to keep its own external index of room names
+    and has no way to detect drift between that index and what is actually
+    persisted.
+
+    Method contract:
+
+      - ListRooms returns the name of every room the store holds data for,
+        meaning at least one stored update or at least one snapshot. Order is
+        UNSPECIFIED: sort the result if you need determinism. Returns an empty
+        slice (not an error) for an empty store.
+
+    RoomLister deliberately does not embed VersionedPersistence, so adding
+    it does not break existing third-party backends; implement it only if
+    enumeration is cheap for the backend. Callers should type-assert for it.
+
+    Enumeration may be O(rooms) and is not a hot path: treat it as an
+    administrative operation, not something to call per request.
+
+type SnapshotInfo struct {
+	// ID is the store-assigned identifier, unique WITHIN A ROOM and
+	// monotonically increasing there (higher ID = newer snapshot). It is never
+	// reused within a room, even after the snapshot is deleted.
+	//
+	// IDs are NOT guaranteed globally unique: the same ID may name a different
+	// snapshot in a different room (backends may count per-room), so always
+	// carry the room alongside the ID and never key a cache on the ID alone.
+	ID int64
+	// Label is the optional caller-supplied name ("before-migration",
+	// "v2 draft"). NOT unique, and may be empty: saving twice under the same
+	// label creates two distinct snapshots rather than overwriting.
+	Label string
+	// CreatedAt is the store-stamped creation time (UTC).
+	CreatedAt time.Time
+	// Size is the state blob length in bytes.
+	Size int64
+}
+    SnapshotInfo is the metadata of one stored snapshot. The state blob itself
+    is fetched separately via GetSnapshotState so listing stays cheap for rooms
+    with many large snapshots.
+
+type SnapshotStore interface {
+	SaveSnapshot(ctx context.Context, room, label string, state []byte) (int64, error)
+	ListSnapshots(ctx context.Context, room string) ([]SnapshotInfo, error)
+	GetSnapshotState(ctx context.Context, room string, id int64) ([]byte, error)
+	DeleteSnapshot(ctx context.Context, room string, id int64) error
+}
+    SnapshotStore is the optional labelled-snapshot extension of
+    VersionedPersistence. A backend that implements it can capture labelled
+    point-in-time snapshots of a room independent of the live update log:
+    the log can be appended to, compacted, or pruned without touching stored
+    snapshots, and snapshots can be deleted without touching the log.
+
+    This is the primitive an application builds a user-facing "version history"
+    on. Note the distinction from ListVersions, which enumerates the raw
+    update log (one entry per stored update) and is a durability concern,
+    not a user-facing one.
+
+    Method contracts:
+
+      - SaveSnapshot stores state (a self-contained V1 update blob carrying
+        the full room state) as a NEW snapshot and returns its ID. Empty state
+        is rejected with ErrEmptySnapshot. label may be empty and need not be
+        unique; repeated saves never overwrite.
+
+      - ListSnapshots returns the metadata of every snapshot of room, NEWEST
+        FIRST (matching ListVersions' ordering). Returns an empty slice (not an
+        error) for an unknown room or a room with no snapshots.
+
+      - GetSnapshotState returns the state blob of one snapshot.
+        ErrSnapshotNotFound if the (room, id) pair is unknown.
+
+      - DeleteSnapshot removes one snapshot. Idempotent: deleting an unknown
+        snapshot is a no-op returning a nil error.
+
+    SnapshotStore deliberately does not embed VersionedPersistence so the
+    latter's contract stays frozen; backends implement both, and callers needing
+    both can take a SnapshotVersionedPersistence.
+
+    The older name-keyed CaptureSnapshot/RestoreSnapshot pair on
+    VersionedPersistence is superseded by this interface for new code:
+    it is keyed by name (so a repeat save overwrites), exposes no metadata,
+    and cannot be enumerated or individually deleted.
+
+type SnapshotVersionedPersistence interface {
+	VersionedPersistence
+	SnapshotStore
+}
+    SnapshotVersionedPersistence is a backend providing both the live update log
+    and labelled snapshots. The memory, file, and sqlite backends implement it.
+
+type Version uint64
+    Version is a per-room update sequence number assigned by AppendUpdate,
+    starting at 1. Within an unbroken history it is dense and increasing;
+    PruneAfter resets the head to its target, after which appends continue at
+    target+1 (versions above a pruned point are superseded and reused for the
+    new history). Zero is the "no version" sentinel (an empty room).
+
+type VersionMeta struct {
+	Version   Version
+	UpdatedAt time.Time
+}
+    VersionMeta describes one stored update without its payload.
+
+type VersionedPersistence interface {
+	// Load returns the materialized head state for room. For an unknown or
+	// empty room it returns a zero LoadResult and a nil error.
+	Load(ctx context.Context, room string) (LoadResult, error)
+
+	// AppendUpdate appends one incremental V1 update to room's log and returns
+	// the newly assigned Version. The update must be a valid V1 update; an
+	// invalid update is rejected without advancing the version.
+	//
+	// An implementation that checks the update by applying it to a scratch
+	// document must give that document no pending-queue cap, as the bundled
+	// stores do:
+	//
+	//	err := crdt.ApplyUpdateV1(crdt.New(crdt.WithMaxPendingItems(math.MaxInt)), update, nil)
+	//
+	// Decoded without the room's stored state, an incremental update parks
+	// every item that depends on that state, and when its client already has
+	// edits stored, that is every item in it. A bare crdt.New() caps the queue
+	// at 100,000, so it refuses a large update the room has already applied,
+	// and the edit is lost.
+	AppendUpdate(ctx context.Context, room string, update []byte) (Version, error)
+
+	// ListVersions returns metadata for every stored update in room,
+	// newest-first. Each entry is a single (non-cumulative) update. Returns an
+	// empty slice (not an error) for an unknown room.
+	ListVersions(ctx context.Context, room string) ([]VersionMeta, error)
+
+	// GetUpdate returns the single (non-cumulative) update stored at version v,
+	// its metadata, and ok=true when present. ok=false (nil error) when the
+	// room or version does not exist.
+	GetUpdate(ctx context.Context, room string, v Version) (update []byte, meta VersionMeta, ok bool, err error)
+
+	// MaterializeAt rebuilds the full V1 head state as of version v by merging
+	// all updates with version <= v (crdt.MergeUpdatesV1). Returns an empty
+	// slice for v == 0. Returns ErrRoomNotFound if room has no updates and
+	// v > 0.
+	MaterializeAt(ctx context.Context, room string, v Version) ([]byte, error)
+
+	// CaptureSnapshot stores a named snapshot for room. state is a portable V1
+	// blob (typically crdt.EncodeStateAsUpdateV1 of the materialized doc — NOT
+	// a crdt.Snapshot state-vector marker). It returns the head Version the
+	// snapshot is associated with (the current highest version, or 0 if empty).
+	// A snapshot with the same (room, name) is overwritten.
+	CaptureSnapshot(ctx context.Context, room, name string, state []byte) (Version, error)
+
+	// RestoreSnapshot returns the V1 blob previously stored under (room, name),
+	// the version it was captured at, and ok=true when present. ok=false (nil
+	// error) when no such snapshot exists.
+	RestoreSnapshot(ctx context.Context, room, name string) (update []byte, v Version, ok bool, err error)
+
+	// PruneAfter removes every update with version > target, making target the
+	// new head. rolledBack is the V1 head state at target (the caller supplies
+	// it, typically from MaterializeAt(target)); it is persisted as a
+	// crash-safe checkpoint BEFORE the deletes so that a crash mid-prune can
+	// never expose a version > target on reopen. After PruneAfter, ListVersions
+	// returns nothing newer than target.
+	PruneAfter(ctx context.Context, room string, target Version, rolledBack []byte) error
+
+	// Compact trims the oldest updates, keeping at most keep of the newest, by
+	// folding the trimmed prefix into the oldest retained update so the
+	// materialized state is preserved. Returns the number of update records
+	// removed. keep <= 0 is treated as keep all (deleted = 0).
+	Compact(ctx context.Context, room string, keep int) (deleted int, err error)
+
+	// Delete removes all data for room (updates, snapshots, checkpoint).
+	Delete(ctx context.Context, room string) error
+}
+    VersionedPersistence is an append-only, versioned CRDT store keyed by room.
+
+    All methods take a context for cancellation; in-memory implementations
+    honor only ctx cancellation at entry, while I/O-backed ones should respect
+    it throughout. Implementations must be safe for concurrent use across
+    rooms; per-room serialization of AppendUpdate is the implementation's
+    responsibility.
+

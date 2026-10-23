@@ -1,0 +1,1221 @@
+package websocket // import "github.com/reearth/ygo/provider/websocket"
+
+Cross-process clustering: attach a cluster.Relay so multiple Server nodes share
+a single logical document/awareness state per room. See cluster_hooks.go for
+the GetAwareness / Rooms accessors used by the cluster.Sink contract, and the
+cluster package for the Relay/Sink interfaces and the reference MemRelay.
+
+Package websocket provides a net/http-compatible WebSocket handler that
+synchronises Yjs documents between multiple peers using the y-protocols sync and
+awareness protocols.
+
+Usage:
+
+    srv := websocket.NewServer()
+    http.Handle("/yjs/{room}", srv)
+    http.ListenAndServe(":8080", nil)
+
+# Quick start
+
+    srv := websocket.NewServer()
+    // Each distinct path is an independent Yjs room.
+    http.Handle("/rooms/", http.StripPrefix("/rooms", srv))
+    http.ListenAndServe(":8080", nil)
+
+See the Example* functions for canonical usage patterns.
+
+# Hocuspocus interop
+
+ygo's y-websocket message dispatcher additionally understands the Hocuspocus
+protocol extensions (tags 4-10: SyncReply, Stateless, BroadcastStateless, Close,
+SyncStatus, Ping, Pong) on the same wire framing, and an in-band Auth (tag 2)
+sub-protocol used by @hocuspocus/provider to authenticate after the WebSocket
+upgrade.
+
+Set Server.OnTokenAuth to validate the token carried in an Auth message:
+a nil error accepts the connection (replying Authenticated with a "read-write"
+or "readonly" scope, per the returned ConnectionConfig); a non-nil error replies
+PermissionDenied and closes the connection with the Hocuspocus 4401 code.
+When OnTokenAuth is nil (the default), Auth (tag 2) frames are ignored — the
+legacy y-websocket behavior, preserved for backward compatibility with clients
+that never send them.
+
+Set Server.HocuspocusFraming to true to additionally read and write the
+Hocuspocus docName-prefixed wire framing (VarString(docName) + frame), enabling
+real interop with an unmodified @hocuspocus/provider client. Leave it false (the
+default) for native y-websocket clients.
+
+On a Hocuspocus-framed connection the server answers every SyncStep2 or Update
+the client sends, under Sync (tag 0) or SyncReply (tag 4), with exactly one
+SyncStatus (tag 8) frame, in the order the frames arrived, so the provider's
+unsynced-changes count drops for every update the room applied (1), and stays
+up for one it did not (0): 0 when the room did not fully apply it (it does not
+decode, or it overflows MaxPendingItems; the part that did integrate still
+reaches the other peers); for a read-only connection, 0 for an Update, and for
+a SyncStep2 1 when the room already holds everything in it and 0 otherwise.
+A sync frame that does not decode gets no SyncStatus: the server closes the
+connection with 1002 (protocol error) and handles no later frame from it.
+
+# Stability
+
+ygo follows semantic versioning. The v1.x public API is considered stable:
+new functionality lands as minor releases; bug fixes as patch releases; breaking
+changes are deferred to v2.
+
+Server-side document injection — BroadcastUpdate, Apply, and CloseRoom
+plus their types, error sentinels, and hook signature. See doc.go for the
+package-level overview.
+
+CONSTANTS
+
+const AutoVersionLabel = "auto"
+    AutoVersionLabel is the label the server passes to
+    VersionableAdapter.SaveVersion for versions it creates on its own, so they
+    can be told apart from versions a user explicitly named.
+
+
+VARIABLES
+
+var (
+	// ErrServerShutdown is returned when a server-side write is attempted
+	// after Server.Shutdown has been called.
+	ErrServerShutdown = errors.New("ygo/websocket: server is shut down")
+	// ErrInvalidRoomName is returned when a room name fails validation
+	// (empty, > 255 bytes, path-unsafe, or contains control characters).
+	ErrInvalidRoomName = errors.New("ygo/websocket: invalid room name")
+	// ErrRoomNotFound is returned when a server-side write targets a
+	// room that does not currently exist. May occur if the last peer
+	// disconnected concurrently; callers broadcasting to ephemeral rooms
+	// should treat this as non-fatal.
+	ErrRoomNotFound = errors.New("ygo/websocket: room not found")
+	// ErrRoomHasPeers is returned by CloseRoom when called with force=false
+	// on a room that still has connected peers.
+	ErrRoomHasPeers = errors.New("ygo/websocket: room has connected peers")
+	// ErrInvalidUpdate is returned when BroadcastUpdate cannot parse the
+	// caller-supplied update bytes as a V1 update.
+	ErrInvalidUpdate = errors.New("ygo/websocket: invalid V1 update")
+	// ErrUpdateTooLarge is returned when an update exceeds MaxUpdateBytes.
+	ErrUpdateTooLarge = errors.New("ygo/websocket: update exceeds MaxUpdateBytes")
+	// ErrTooManyRooms is returned when auto-creating a room would
+	// exceed Server.MaxRooms.
+	ErrTooManyRooms = errors.New("ygo/websocket: MaxRooms exceeded")
+	// ErrNoChanges is returned by Apply when fn produces no delta
+	// (either never called transact or called transact with a no-op body).
+	ErrNoChanges = errors.New("ygo/websocket: no changes produced")
+	// ErrInjectRefused is returned when the OnInject hook returns a
+	// non-nil error. The hook's error is wrapped as the cause and
+	// remains reachable via errors.Unwrap.
+	ErrInjectRefused = errors.New("ygo/websocket: inject refused")
+)
+    Error sentinels returned by BroadcastUpdate, Apply, and CloseRoom. Callers
+    should compare with errors.Is rather than ==.
+
+var ErrNilRelay = errors.New("ygo/websocket: nil relay")
+    ErrNilRelay is returned by AttachRelay when passed a nil relay.
+
+var ErrPeerUpdateApplied = errors.New("ygo/websocket: peer update already applied")
+    ErrPeerUpdateApplied is what apply returns when the hook calls it again
+    after it already ran.
+
+var ErrPeerUpdateHookReturned = errors.New("ygo/websocket: apply called after OnPeerUpdate returned")
+    ErrPeerUpdateHookReturned is what apply returns when it is called after the
+    hook returned. It applies nothing.
+
+var ErrRelayAlreadyAttached = errors.New("ygo/websocket: relay already attached")
+    ErrRelayAlreadyAttached is returned by AttachRelay if a relay is already
+    set.
+
+
+TYPES
+
+type CompactableAdapter interface {
+	Compact(ctx context.Context, room string) error
+}
+    CompactableAdapter is an optional extension to PersistenceAdapter. When
+    the adapter implements it, the server calls Compact to signal a good time
+    to collapse stored updates for a room into a compact form (e.g. merge the
+    update log into a snapshot, prune old versions) — on room unload, and, when
+    Server.CompactEvery > 0, after every N persistence flushes on the coalescing
+    path (see Server.CompactEvery's own field doc and startPersistenceWorker's
+    doc for why: onFlushed, the call site that counts those N flushes, is only
+    reachable from there — the strict (coalescing-disabled) path never calls it,
+    so those deployments get on-unload compaction only).
+
+    Compact is invoked from the room's persistence worker goroutine, serialised
+    with StoreUpdate for that room INSTANCE, so implementations need no extra
+    locking against that worker's own writes. It is best-effort: a returned
+    error (or panic) is logged and does not abort persistence. Retention policy
+    (how much history to keep) is the adapter's concern.
+
+    That serialisation is per room INSTANCE, not per room NAME — read this if
+    your Compact mutates shared state keyed by name. Two sources of overlap:
+
+      - Teardown followed by re-creation. A room's worker can still be in
+        its exit-path Compact while a client reconnects and a brand-new
+        room of the same name starts writing. This window predates #229 (see
+        handleDisconnect's flush-then-evict sequence in peer.go).
+      - A retained *crdt.Doc. Nothing calls doc.Destroy on teardown,
+        so a caller holding the doc — from GetDoc, or from an OnLoadDocument
+        hook — keeps its persistence observer alive, and every later commit is
+        written directly by the committing goroutine (#229; before #229 those
+        commits were silently dropped instead). Those writes are serialised
+        among themselves, but not against a successor room of the same name,
+        and they are unbounded in time.
+
+    If your adapter's Compact is not safe against a concurrent StoreUpdate
+    for the same room name, serialise inside the adapter. Every store this
+    repo ships behind persistence.LegacyAdapter already does, each serialising
+    its writers under a single mutex: persistence.MemoryPersistence and
+    persistence.FilePersistence do so for every operation, reads included;
+    persistence/sqlite's reads (Load, ListVersions, GetUpdate, MaterializeAt)
+    are deliberately lock-free instead and consistent by other means (see that
+    package's methods.go) — but its Compact and AppendUpdate are both writers
+    serialised under its own mutex, which is the property this section actually
+    depends on.
+
+    On room unload, Compact runs synchronously in the worker's exit path.
+    Compact is invoked with context.Background() (it is not cancelled by
+    Server.Shutdown), so a slow or hanging Compact delays that room's teardown
+    and its worker goroutine can outlive Shutdown's return (Shutdown stops
+    waiting when its caller's ctx fires, but the worker keeps running until
+    Compact returns).
+
+type ConnectionConfig struct {
+	// ReadOnly, when true, makes the peer read-only: it receives document and
+	// awareness broadcasts but its inbound writes are dropped server-side. See
+	// Server.Authorize for the exact semantics.
+	ReadOnly bool
+}
+    ConnectionConfig describes an accepted WebSocket connection. It is returned
+    by Server.Authorize (issue #59). Additional per-connection settings can be
+    added here in a backward-compatible way.
+
+type InjectHook func(ctx context.Context, info InjectInfo) error
+    InjectHook is called before every server-side write. Return a non-nil error
+    to refuse the operation; the error is wrapped and returned to the caller.
+
+type InjectInfo struct {
+	// Room is the room name the operation targets.
+	Room string
+	// Op identifies the calling method.
+	Op InjectOp
+	// UpdateSize is the length of the update bytes for BroadcastUpdate,
+	// or 0 for Apply (the delta has not yet been produced).
+	UpdateSize int
+}
+    InjectInfo is passed to OnInject. Additional fields may be added in future
+    versions; callers must not rely on the struct being fixed-size.
+
+    Fields:
+      - Room: the room name the operation targets.
+      - Op: identifies the calling method (BroadcastUpdate or Apply).
+      - UpdateSize: length of the update bytes for BroadcastUpdate, or 0 for
+        Apply (the delta has not yet been produced).
+
+type InjectOp int
+    InjectOp identifies which server-side write path is being invoked.
+
+const (
+	// OpBroadcastUpdate is passed to OnInject when BroadcastUpdate is
+	// the calling method.
+	OpBroadcastUpdate InjectOp = iota
+	// OpApply is passed to OnInject when Apply is the calling method.
+	OpApply
+)
+func (o InjectOp) String() string
+    String returns a human-readable name for the op.
+
+type MemoryPersistence struct {
+
+	// CompactEvery bounds how many appended updates a room accumulates before
+	// this adapter folds them into one. 0 or less means the default (500).
+	// Set before serving; read without synchronisation.
+	CompactEvery int
+
+	// Has unexported fields.
+}
+    MemoryPersistence is a thread-safe in-memory PersistenceAdapter. It APPENDS
+    each incremental update and periodically folds a room's backlog into a
+    single blob, rather than re-merging the whole document on every write.
+
+    The distinction is the point of #186: merging on every write costs
+    O(document) per flush and O(document²) over a session, which is exactly
+    what PersistenceAdapter's own doc warns adapters not to do. Appending
+    costs O(update); the O(document) fold is still paid, but only once per
+    CompactEvery writes rather than on every one — the O(document) cost is
+    divided by CompactEvery, not eliminated.
+
+    It compacts ITSELF rather than waiting for Server.CompactEvery, which is off
+    by default (see that field's doc) — an adapter that only appended and waited
+    to be told would grow without bound for anyone who had not opted in.
+
+    Trade, stated plainly: LoadDoc is no longer O(1). It folds whatever records
+    a room still holds — bounded by CompactEvery — and persists that fold,
+    so subsequent loads are cheap again. Writes are continuous and loads are
+    once per room residency, so this is the right direction, but it is not free.
+
+    Still primarily for tests and single-process deployments; a multi-process
+    deployment wants persistence/sqlite or another VersionedPersistence.
+
+    Must be constructed with NewMemoryPersistence. The zero value has a nil
+    internal adapter; every method reports that with a plain error rather than
+    panicking, but there is no working zero value — always use the constructor.
+
+func NewMemoryPersistence() *MemoryPersistence
+    NewMemoryPersistence returns an empty MemoryPersistence.
+
+func (m *MemoryPersistence) Compact(ctx context.Context, room string) error
+    Compact folds the room's appended records into one, satisfying the optional
+    CompactableAdapter interface so the server's on-unload and CompactEvery
+    compaction work too (both are additive to this type's own threshold).
+
+    MergeUpdatesV1 (invoked by the wrapped adapter, below) runs OUTSIDE m.mu,
+    by design: a large room's fold must never block another room's counter
+    update. That window is what makes the bookkeeping delicate — a concurrent
+    StoreUpdate can append while this call is folding, and a concurrent Compact
+    can fold and report while this one is still in flight.
+
+    The bookkeeping is therefore MONOTONE rather than snapshot-and-subtract.
+    This call reads the room's appended-count as its mark BEFORE folding, and
+    on success advances the room's folded-count to that mark only if it moves it
+    forward. Two properties follow, and both are needed:
+
+      - A write appended after this fold began is never forgiven by it,
+        because the mark was read before it. Erasing such a write's contribution
+        is what let the un-folded record count exceed CompactEvery indefinitely
+        once writes stopped — the first round of this bug (PR #230 review),
+        reported against a line that deleted the room's entry unconditionally.
+      - A compaction that finishes late can never retract a later one's
+        progress, because folded only moves forward. Subtracting a snapshot
+        instead reintroduced the same erasure between two overlapping Compact
+        calls — the second round of the same review.
+
+    It can still under-forgive in the harmless direction: a write that lands
+    late enough to actually be swept into this fold is nonetheless counted
+    toward the next one, so the next compaction fires at most one write early.
+    That is bounded, and bounded-early is the correct way to be wrong here.
+
+    On failure the fold's progress mark is left untouched — the records it could
+    not fold are still outstanding — but the automatic trigger BACKS OFF: each
+    consecutive failure doubles the number of writes before the next attempt,
+    up to 64x the base cadence, and the first success resets it (#239).
+
+    Without that, outstanding() stays over the threshold and every subsequent
+    write retries the fold, each retry paying a full merge over a log the failed
+    retry could not shrink — quadratic total work for a permanently failing
+    fold, which is the realistic case here (a record MergeUpdatesV1 cannot fold
+    fails identically every time).
+
+    The backoff governs only the AUTOMATIC trigger in StoreUpdate. This method
+    is the explicit "fold now" API — a direct call, LoadDoc, or the server's
+    CompactableAdapter path always attempts the fold, and Server.CompactEvery
+    has its own damping (onFlushed zeroes its counter before the attempt).
+
+func (m *MemoryPersistence) LoadDoc(room string) ([]byte, error)
+    LoadDoc returns the room's state as one V1 update, folding any outstanding
+    appended records first so later loads are cheap again. Compaction failure is
+    not fatal here: the adapter can still materialise the room from its records.
+
+func (m *MemoryPersistence) StoreUpdate(room string, update []byte) error
+    StoreUpdate appends update, then folds the room once it has accumulated
+    CompactEvery writes.
+
+    It returns ONLY the append error. A failed fold is swallowed deliberately:
+    the write itself succeeded, the server reports StoreUpdate errors as
+    persistence failures, and returning a compaction error would misreport
+    a successful write. This mirrors CompactableAdapter's own best-effort
+    contract. Callers who need the error can call Compact directly.
+
+    This type deliberately does NOT implement PersistenceAdapterContext.
+    An in-memory append has nothing to abort, so a StoreUpdateContext
+    forwarding to the wrapped adapter would buy nothing and would newly satisfy
+    PersistenceAdapterContext, switching the server's persistence worker onto
+    its ctx-aware path purely to gain a cancellation this adapter cannot act
+    on — persistence.MemoryPersistence.AppendUpdate simply returns ctx.Err() at
+    entry, discarding the write.
+
+    When this was briefly implemented during #186, that cost 51-151 of 200
+    concurrent writes across trials during a concurrent Shutdown, because the
+    shutdown drain then reused a ctx a separate goroutine cancels concurrently.
+    #229 has since fixed the worker side of that — every final flush now uses
+    a background ctx, and a store aborted by cancellation is retained and
+    re-stored rather than dropped, so a ctx-aware adapter no longer loses the
+    tail. The reason to stay off that path is now the plain one: cancellation is
+    a lever for adapters with something to abort, and this one has nothing.
+
+type PeerClose struct {
+	Code   int
+	Reason string
+}
+    PeerClose is an error Server.OnPeerUpdate returns to close the peer whose
+    update it refused, with Code and Reason in the close frame. Code should
+    be an application code (4000-4999). Only 1000 and 3000-4999 are sent,
+    the rule ServeHTTP applies to a context cause's close code: the codes
+    below 3000 other than 1000 are reserved for the WebSocket protocol and its
+    implementations, so with one (or 5000 and above) the peer is closed with
+    4205 "Reset Connection" instead, as for a plain error. A nil *PeerClose is a
+    plain error too. Invalid UTF-8 is dropped from Reason, and a Reason longer
+    than a close frame carries (123 bytes) is cut at a rune boundary.
+
+func (c *PeerClose) Error() string
+
+type PeerUpdateHook func(info PeerUpdateInfo, apply func() error) error
+    PeerUpdateHook is the signature of Server.OnPeerUpdate. apply applies
+    info.Update to info.Doc as the room does without a hook, returning the
+    apply's error (an update whose V1 bytes do not decode, or one that overflows
+    MaxPendingItems); a second call returns ErrPeerUpdateApplied without
+    applying anything. apply must be called before the hook returns: a call
+    after it returns applies nothing and returns ErrPeerUpdateHookReturned,
+    since by then the peer has been answered and the update would reach no
+    other peer. The hook runs on the peer's read loop, so the peer's next frame
+    waits for it. apply takes the document's write lock, so calling it inside
+    info.Doc.Transact deadlocks the room.
+
+    A hook that refuses the update — returns without apply having applied it,
+    or panics before that — closes the peer: with the code and reason of a
+    *PeerClose when the hook's error is or wraps one, and with 4205 "Reset
+    Connection" otherwise, as @hocuspocus/server closes on a beforeHandleMessage
+    rejection. When apply ran and the room itself did not take the update (apply
+    returned an error), the peer is answered as it would be without a hook,
+    and closed only for a *PeerClose.
+
+    The close is needed because the client's later edits build on the refused
+    one, so the room could not integrate them. The client still holds the
+    refused edit, so when it reconnects it sends it again, with any edit
+    built on it, and the hook sees each of them again; an edit the hook
+    applies that builds on a refused one parks in the room (Doc.PendingStats).
+    @hocuspocus/provider 2.x reconnects at once after a 4205 close; a *PeerClose
+    with 4401 stops it reconnecting.
+
+type PeerUpdateInfo struct {
+	// Room is the room name the update arrived on.
+	Room string
+	// Doc is the room's document, which apply applies the update to.
+	Doc *crdt.Doc
+	// Update is the update's V1 bytes, the content of the sync message.
+	// The hook must not modify or retain it.
+	Update []byte
+	// Origin is the transaction origin apply applies the update with, which
+	// the document's OnUpdate observers receive.
+	Origin any
+}
+    PeerUpdateInfo is passed to Server.OnPeerUpdate for each SyncStep2 or
+    Update a read-write peer sends. Fields may be added in future versions;
+    callers must not rely on the struct being fixed-size.
+
+type PersistenceAdapter interface {
+	// LoadDoc returns the full binary V1 update representing stored state for
+	// the room, or (nil, nil) if no state exists yet.
+	LoadDoc(room string) ([]byte, error)
+	// StoreUpdate is called with each incremental V1 update produced by a
+	// transaction in the room. The adapter is responsible for merging or
+	// appending updates as appropriate for its storage model.
+	StoreUpdate(room string, update []byte) error
+}
+    PersistenceAdapter is implemented by storage backends that want to persist
+    room state across server restarts. It is called on every committed update so
+    implementations should be efficient (e.g. append-only log rather than full
+    re-encode on every write).
+
+    By default the server coalesces bursts of updates and calls StoreUpdate
+    once per debounced batch (a single merged V1 update) rather than once per
+    transaction; see Server.PersistCoalesceWindow.
+
+type PersistenceAdapterContext interface {
+	// StoreUpdateContext is the context-aware variant of StoreUpdate. It is
+	// called with a ctx that is cancelled when Server.Shutdown begins. The
+	// adapter should respect cancellation (e.g., abort the network call or
+	// DB transaction) and return ctx.Err() when ctx is done.
+	StoreUpdateContext(ctx context.Context, room string, update []byte) error
+}
+    PersistenceAdapterContext is an optional extension to PersistenceAdapter.
+    Adapters that implement this interface receive a context that is cancelled
+    when the server begins shutdown, letting the adapter abort in-flight
+    writes (network calls, DB queries, etc.) rather than blocking Shutdown
+    indefinitely.
+
+    The persistence worker checks for this interface at runtime via a type
+    assertion. Adapters that implement only PersistenceAdapter remain fully
+    supported — the worker falls back to StoreUpdate when StoreUpdateContext is
+    unavailable.
+
+    Pattern mirrors io.WriterTo / http.CloseNotifier and the database/sql/driver
+    Queryer / QueryerContext family in the standard library.
+
+type RelayStats struct {
+	// Coalesced counts outbound KindSync updates absorbed into another blob
+	// by a merge.
+	Coalesced uint64
+	// AwarenessSuperseded counts awareness blobs replaced before publish.
+	// Benign: awareness is idempotent heartbeat state.
+	AwarenessSuperseded uint64
+	// HardDrops counts payloads lost because a merge failed on a saturated
+	// lane. Should always be zero.
+	HardDrops uint64
+	// Dropped counts every payload that was lost after the commit path
+	// handed it to the outbound side: discarded before reaching a lane (no
+	// relay attached at enqueue time, or a genuine straggler that lost its
+	// race against its lane's own retirement — see enqueueRelayOutbound's
+	// doc), taken from a lane but abandoned because relay.Publish returned
+	// an error (there is no retry path — see publishRelay), or still queued
+	// in a lane when Shutdown had to give up on delivery (see
+	// discardRelayLane). Should always be zero in a healthy deployment.
+	//
+	// Since the #202 fix there is no shutdown exception: Server.Shutdown
+	// drains each lane under the still-live relay context before cancelling
+	// it, and whatever it cannot deliver within its ctx budget is counted
+	// here. Dropped and HardDrops both reading zero after a Shutdown means
+	// nothing was lost.
+	Dropped uint64
+}
+    RelayStats is a point-in-time snapshot of this server's OUTBOUND relay
+    health, summed across every room lane this server has ever had — live
+    ones plus ones since retired (by stopRelayLane's ordinary teardown or
+    ensureRelayLane's predecessor-displacement handoff; their final counts are
+    folded into s.relayRetired before the lane is dropped — see relayRetired's
+    doc in server.go), mirroring cluster/redis's Relay.Stats() / retired field
+    for the identical reason. For the inbound side, see the relay adapter's own
+    Stats (e.g. cluster/redis.Relay.Stats).
+
+    Coalesced/AwarenessSuperseded/HardDrops must be kept in sync with
+    relaylane.Stats — see RelayStats' construction in the method below, and
+    TestPublicStatsCoverRelaylaneFields (cluster_redis_test.go), which reflects
+    over both this type and cluster/redis.Stats and fails if either falls out of
+    sync with relaylane.Stats's field set.
+
+    Coalesced going non-zero means at least one room's publishes fell behind and
+    were merged (lossless). Dropped or HardDrops going non-zero means updates
+    were lost and peer nodes may be diverged — alert on both.
+
+    Monotonicity: every field here is guaranteed to never decrease across the
+    life of the Server — see RelayStats()'s doc for exactly why, and for the two
+    accepted undercount gaps (never a decrease, just an occasional missed count)
+    that mirror the inbound side's identical, accepted gaps.
+
+type Server struct {
+
+	// AuthFunc, if non-nil, is called before upgrading each incoming WebSocket
+	// connection. Return false to reject the connection; the server responds
+	// with 401 Unauthorized. Use this hook for token validation, session checks,
+	// or IP allow-lists. If nil, all connections are accepted.
+	//
+	// AuthFunc grants read-write access. To grant read-only access, use Authorize
+	// instead — when Authorize is set it takes precedence and AuthFunc is ignored.
+	AuthFunc func(r *http.Request) bool
+
+	// HocuspocusFraming, when true, makes this server read and write the
+	// Hocuspocus docName-prefixed framing: every frame is
+	// VarString(docName) + <y-websocket frame>. Enables real @hocuspocus/provider
+	// interop. One room per connection is still enforced (no multi-document
+	// multiplexing); the inbound docName is read and used only for logging.
+	// Such a connection is also answered one SyncStatus (tag 8) frame for every
+	// SyncStep2 or Update it sends, in order, and closed with 1002 when it sends
+	// a sync frame that does not decode (see the package documentation for the
+	// answers).
+	// Leave false (default) for native y-websocket clients — the two framings
+	// cannot be auto-detected on one endpoint.
+	HocuspocusFraming bool
+
+	// Authorize, if non-nil, is the richer alternative to AuthFunc: it both
+	// accepts/rejects the connection (second return value; false → 401) and
+	// returns a ConnectionConfig describing the accepted connection — notably
+	// whether it is read-only (issue #59). When Authorize is set it takes
+	// precedence over AuthFunc. A read-only peer receives document and awareness
+	// broadcasts but its inbound writes (SyncStep2/Update and awareness updates)
+	// are dropped; it can still request state (SyncStep1 is answered) and query
+	// awareness. Stateless signals are not gated by read-only.
+	Authorize func(r *http.Request) (ConnectionConfig, bool)
+
+	// AllowedOrigins is the list of origins permitted to open WebSocket
+	// connections (C2 — CORS). Each entry is a full origin string, e.g.
+	// "https://example.com". An entry may contain "*" wildcards, each matching
+	// any run of characters: "https://*.example.com" matches any subdomain and
+	// "https://pr-*---web-*.run.app" matches preview hosts. A bare "*" allows any
+	// origin. Matching is case-insensitive.
+	//
+	// If the slice is empty the server falls back to a same-origin check:
+	// the request Origin header must match the HTTP Host header. Non-browser
+	// clients that omit the Origin header are always permitted.
+	//
+	// Security warning: setting AllowedOrigins to "*" disables same-origin
+	// protection and enables Cross-Site WebSocket Hijacking (CSWSH) — a
+	// malicious page that the user visits can open a WebSocket to this
+	// server and act as that user if authentication is carried by a session
+	// cookie. Use "*" only when AuthFunc validates tokens carried explicitly
+	// (bearer tokens in the WebSocket subprotocol or a query parameter), not
+	// when relying on cookie-based auth. See SECURITY.md.
+	AllowedOrigins []string
+
+	// MaxConnections is the server-wide cap on simultaneous WebSocket peers.
+	// Upgrade requests that would exceed this limit are rejected with 503.
+	// Zero (the default) means unlimited (N-H5).
+	MaxConnections int
+
+	// MaxPeersPerRoom is the per-room cap on simultaneous WebSocket peers.
+	// Upgrade requests that would exceed this limit are rejected with 503.
+	// Zero (the default) means unlimited (N-H5).
+	MaxPeersPerRoom int
+
+	// OnInject, if non-nil, is called before every server-side write
+	// (BroadcastUpdate or Apply). Return a non-nil error to refuse the
+	// operation; the error is wrapped and returned to the caller.
+	// For BroadcastUpdate, InjectInfo.UpdateSize is len(update); for
+	// Apply it is 0 (the delta has not yet been produced).
+	OnInject InjectHook
+
+	// OnStateless, if non-nil, is called when a peer sends a Hocuspocus
+	// Stateless (tag 5) or BroadcastStateless (tag 6) message. The hook
+	// is purely informational — for BroadcastStateless the server has
+	// already fanned the payload out to other peers in the room by the
+	// time the hook fires. Use this to surface out-of-band signals
+	// (Tiptap comments, custom presence metadata, application heartbeats)
+	// to the embedding application.
+	OnStateless StatelessHook
+
+	// OnPeerUpdate, if non-nil, runs in place of the room's own apply of a
+	// SyncStep2 or Update a read-write peer sent, under Sync (tag 0) or
+	// SyncReply (tag 4), so the embedder can refuse it before it reaches the
+	// room or any other peer, or hold a lock of its own across the apply.
+	// apply applies the update exactly as the room does without a hook, and
+	// must be called before the hook returns. An update apply did not apply
+	// is not broadcast and is answered SyncStatus(0) on a Hocuspocus-framed
+	// connection; when the hook refused it, the peer is then closed, with the
+	// code of a *PeerClose the hook's error is or wraps and with 4205 "Reset
+	// Connection" otherwise. An update apply applied is broadcast and answered
+	// SyncStatus(1) whatever the hook returns. A read-only peer's update never
+	// reaches the hook. Nil keeps the behaviour without a hook. See
+	// PeerUpdateHook.
+	OnPeerUpdate PeerUpdateHook
+
+	// OnTokenAuth, if non-nil, validates the token from a Hocuspocus in-band
+	// Auth message (tag 2). A nil error accepts the connection and replies
+	// Authenticated (scope from the returned ConnectionConfig.ReadOnly); a
+	// non-nil error replies PermissionDenied(err) and closes with WS 4401.
+	// When nil, tag-2 frames are silently ignored (unchanged legacy behavior).
+	//
+	// OnTokenAuth complements the HTTP-boundary AuthFunc/Authorize; it does not
+	// replace them. IMPORTANT: it is NOT a document-confidentiality gate — the
+	// initial sync is served before any PermissionDenied, so deployments that
+	// must withhold document contents from unauthenticated clients must reject
+	// them at the boundary via AuthFunc/Authorize.
+	OnTokenAuth func(room, token string) (ConnectionConfig, error)
+
+	// OnLoadDocument, if non-nil, is called once per room immediately
+	// after the document has been bootstrapped from the PersistenceAdapter
+	// (or freshly constructed when no adapter is configured) but before
+	// any peer can interact with it. Returning a non-nil error fails room
+	// creation: peer upgrades / Apply / BroadcastUpdate against the room
+	// receive that error wrapped as a room-load failure. Use this to wire
+	// in a custom resolver, decrypt-at-rest, schema-migration check, or
+	// any other one-time per-room setup. (#60)
+	//
+	// As of #182 the hook runs OFF the global room-map lock (s.rmu): the
+	// room is published as a not-yet-ready placeholder under s.rmu, then
+	// LoadDoc + decode + this hook run with s.rmu released. A slow hook
+	// therefore no longer stalls create / lookup / evict for other rooms —
+	// it only delays callers waiting on THIS room's ready barrier. The doc
+	// passed in is owned by the server — retaining a reference past the hook
+	// return is safe as long as the caller serialises access through Transact
+	// / public APIs.
+	OnLoadDocument func(ctx context.Context, room string, doc *crdt.Doc) error
+
+	// OnUnloadDocument, if non-nil, is called once per room immediately
+	// after the room has been evicted from the server's in-memory map.
+	// Fires from both handleDisconnect (last-peer-leaves) and CloseRoom.
+	// Use this to release per-room caches, flush metrics, or notify
+	// downstream systems that the doc is no longer hot. (#60)
+	OnUnloadDocument func(ctx context.Context, room string)
+
+	// OnFirstPeer, if non-nil, fires when a room transitions from 0 to 1
+	// peers — i.e. the first peer just joined this active session of the
+	// document. Useful for warm-up tasks (preloading caches, opening
+	// downstream connections). Fires after the peer has been registered
+	// with the room and after all server locks have been released. ctx is
+	// the WebSocket request context; it is cancelled when the peer's HTTP
+	// request is cancelled. (#60)
+	//
+	// Note: under heavy churn the (OnFirstPeer / OnLastPeer) pair for the
+	// same room may interleave out of strict time order — implementations
+	// must be idempotent against repeated transitions.
+	OnFirstPeer func(ctx context.Context, room string)
+
+	// OnLastPeer, if non-nil, fires when a room transitions from 1 to 0
+	// peers — i.e. the last peer just disconnected. Useful for cool-down
+	// tasks (releasing caches, closing downstream connections, scheduling
+	// the eventual OnUnloadDocument). Fires before OnUnloadDocument when
+	// both apply. ctx is context.Background() — the WS request that owned
+	// the peer has already terminated by this point. (#60)
+	OnLastPeer func(ctx context.Context, room string)
+
+	// MaxUpdateBytes is the maximum size of a single V1 update that
+	// BroadcastUpdate will fan out, or that Apply will produce and
+	// fan out. Zero means use the same 64 MiB default applied to
+	// WebSocket peer frames (maxWSMessageBytes).
+	MaxUpdateBytes int
+
+	// MaxRooms caps the total number of rooms the server will hold at
+	// once, across both peer-upgrade-created and Apply-created rooms.
+	// Zero means unlimited. Enforcement applies uniformly: peer upgrades
+	// past the cap receive HTTP 503; Apply past the cap returns
+	// ErrTooManyRooms.
+	MaxRooms int
+
+	// MaxMessageBytes is the per-message size cap on the WebSocket read path.
+	// Frames larger than this are rejected by the underlying gorilla/websocket
+	// library (which closes the connection with code 1009). Zero (the default)
+	// uses the package default of 64 MiB, which matches Rust yrs-warp's underlying
+	// warp default. Yjs JS's y-websocket inherits ws library's 100 MiB default.
+	//
+	// Lower this for stricter limits in untrusted multi-tenant deployments;
+	// raise it for unusual bulk-sync workloads.
+	MaxMessageBytes int64
+
+	// MessageRateLimit caps the sustained inbound-message rate (messages per
+	// second) for each peer. Zero (the default) means unlimited, preserving
+	// existing behaviour. When set, every peer gets its own token-bucket limiter;
+	// a peer that exceeds it is disconnected (issue #51). Disconnect — rather than
+	// dropping the offending message — is deliberate: silently discarding a CRDT
+	// update would leave that peer permanently diverged.
+	MessageRateLimit rate.Limit
+
+	// MessageRateBurst is the token-bucket burst size paired with
+	// MessageRateLimit (how many messages may arrive back-to-back before the
+	// sustained rate applies). Ignored when MessageRateLimit is zero. Zero or
+	// negative with a non-zero MessageRateLimit defaults to defaultRateBurst.
+	MessageRateBurst int
+
+	// Logger receives structured log entries for connection lifecycle, write
+	// failures, slow-peer disconnects, and persistence errors. nil falls back
+	// to slog.Default(). Most operators want to wire this to their app logger
+	// rather than rely on the default.
+	Logger *slog.Logger
+
+	// PeerWriteQueueSize is the buffer capacity of each peer's broadcast
+	// write queue. When the queue fills (slow peer / dead connection), the
+	// peer is disconnected — forcing them to reconnect and re-sync via the
+	// CRDT's pending-structs machinery. Matches yrs-warp's bounded-broadcast
+	// pattern.
+	//
+	// Zero (the default) uses 512, sized for typical sync workloads.
+	PeerWriteQueueSize int
+
+	// SlowPeerPolicy selects the reaction when a peer's broadcast write queue
+	// overflows: SlowPeerDisconnect (default) closes the connection; SlowPeerResync
+	// keeps it open and re-syncs the peer in place. See SlowPeerPolicy. Like the
+	// other config fields, set it before serving; it is read without
+	// synchronisation and must not be mutated while the server is handling
+	// connections.
+	SlowPeerPolicy SlowPeerPolicy
+
+	// RoomIdleTimeout, when > 0, switches room eviction from eager to lazy
+	// (#183): when the last peer leaves a room, the v1.37.0 durable
+	// flush-before-evict still runs (so pending writes are never lost), but
+	// the room is NOT deleted from the server map — it is stamped idle
+	// (its idleSince timestamp is set) and stays resident, worker and
+	// in-memory doc alive. A rejoin before eviction reuses the warm doc with
+	// no LoadDoc / reload. Actually evicting rooms whose idle time exceeds
+	// this timeout is done by a separate background sweeper; setting this
+	// field alone only stops eager eviction and marks rooms idle — without a
+	// sweeper an idle room simply stays resident indefinitely, which is safe
+	// (just extra memory) but never reclaims it on its own. A room that Apply
+	// or a relay delivery (Inject) touched is stamped idle when that call
+	// returns if no peer is connected, so rooms only server-side writers touch
+	// are reclaimed the same way.
+	//
+	// Zero (the default) preserves the original eager-evict behaviour: the
+	// room is deleted from the server map and OnUnloadDocument fires the
+	// instant the last peer disconnects. Like the other config fields, set
+	// this before serving; it is read without synchronisation and must not be
+	// mutated while the server is handling connections.
+	RoomIdleTimeout time.Duration
+
+	// MaxResidentRooms, when > 0, bounds how many IDLE-resident rooms the
+	// server keeps warm at once (#183, G4). When RoomIdleTimeout > 0 an empty
+	// room is not evicted immediately but stamped idle and left resident so a
+	// rejoin reuses the warm doc; without a bound, a workload that touches many
+	// distinct rooms would accumulate them until each individually ages past
+	// RoomIdleTimeout. This cap makes the idle set an LRU: whenever the count of
+	// idle-resident rooms exceeds MaxResidentRooms, the background sweeper evicts
+	// the least-recently-idle rooms first (smallest idleSince) — durably flushing
+	// each before eviction — until the count is back within the bound, even for
+	// rooms that have not yet reached RoomIdleTimeout. Active rooms (with peers)
+	// are never counted or evicted.
+	//
+	// Only meaningful together with RoomIdleTimeout > 0 (only then are rooms
+	// stamped idle and a sweeper started); it is ignored in eager-evict mode.
+	// Zero (the default) means unlimited idle residency. Like the other config
+	// fields, set it before serving; it is read without synchronisation and must
+	// not be mutated while the server is handling connections.
+	MaxResidentRooms int
+
+	// PersistCoalesceWindow controls debounced coalescing of persistence
+	// writes. Buffered updates are merged into a single StoreUpdate rather than
+	// written one-per-update. The window is a debounce: each new update resets
+	// it; see PersistCoalesceMaxWait for the hard ceiling.
+	//
+	//   0  — default (2s): coalescing ON (matches Hocuspocus).
+	//   <0 — disabled: strict one StoreUpdate per update (pre-v1.36 behaviour).
+	//   >0 — debounce window of this duration.
+	//
+	// Only affects servers with a PersistenceAdapter configured. Like the other
+	// config fields, set it before serving; it is read without synchronisation
+	// and must not be mutated while the server is handling connections.
+	//
+	// When disabled (<0), the strict per-update path — like the pre-v1.36
+	// behaviour — uses the cancellable worker context for its shutdown drain,
+	// so a context-respecting adapter may abort the final buffered writes on
+	// shutdown; the default coalescing path flushes the final batch with a
+	// background context and is more durable at shutdown.
+	PersistCoalesceWindow time.Duration
+
+	// PersistCoalesceMaxWait bounds how long a buffered update waits before it is
+	// flushed, measured from the batch's first update (Hocuspocus maxDebounce).
+	// Under sustained editing the debounce window keeps resetting, so flushes
+	// occur every PersistCoalesceMaxWait and durable state can lag live state by
+	// up to this duration. 0 uses the default (10s). The effective value is
+	// clamped to be at least the effective PersistCoalesceWindow, so any value
+	// below the window — including a negative one — resolves to the window
+	// rather than the 10s default (a negative maxWait is NOT a disable switch;
+	// only a negative PersistCoalesceWindow disables coalescing). Ignored when
+	// coalescing is disabled.
+	PersistCoalesceMaxWait time.Duration
+
+	// CompactEvery, when > 0, asks a CompactableAdapter to Compact a room after
+	// every N successful (non-empty) persistence flushes, bounding version
+	// growth for long-lived, always-connected documents. 0 (default) compacts
+	// only on room unload. Ignored when the adapter does not implement
+	// CompactableAdapter, and on the disabled (PersistCoalesceWindow < 0) path
+	// (which has no flush cycle — those deployments get on-unload compaction
+	// only). Like the other config fields, set it before serving; it is read
+	// without synchronisation.
+	CompactEvery int
+
+	// AutoVersionEvery, when > 0, asks a VersionableAdapter to capture a labelled
+	// version of a room at most this often, and only when the room changed since
+	// the last version, giving a user-facing history that does not grow one entry
+	// per edit. A room with no activity is never versioned; a room that changed
+	// after its last version is versioned once more on unload so the session's
+	// end state survives.
+	//
+	// The interval is measured from the previous version (or from worker start),
+	// and is evaluated on persistence flushes rather than on a timer, so it is
+	// checked only when there is something to version. That means the actual gap
+	// between versions is AutoVersionEvery rounded up to the next flush.
+	//
+	// 0 (default) disables auto-versioning entirely. Ignored when the adapter does
+	// not implement VersionableAdapter. Set before serving; read without
+	// synchronisation.
+	AutoVersionEvery time.Duration
+
+	// MaxPendingItems caps the per-document pending-items queue depth. The
+	// queue holds items whose dependencies have not yet arrived, waiting for
+	// out-of-order delivery to resolve. Zero or negative uses the crdt default
+	// (100,000). See crdt.WithMaxPendingItems and issue #46.
+	MaxPendingItems int
+
+	// HandshakeTimeout caps how long a peer may stay connected without sending
+	// any message after the WebSocket upgrade completes. This is the first-line
+	// defense against slow-loris-style attacks where an attacker completes the
+	// handshake on many connections and then sends nothing, holding goroutines
+	// and buffers indefinitely. After the first successful ReadMessage the
+	// deadline is cleared. Zero or negative uses the default (30 seconds).
+	// See #47.
+	HandshakeTimeout time.Duration
+
+	// MaxAwarenessBytesPerRoom caps the cumulative byte size of awareness
+	// state held in one room across all remote clients. Without this cap a
+	// single peer can claim up to maxAwarenessClientsPerPeer (10,000)
+	// clientIDs each holding the maximum per-state size (1 MiB) — up to
+	// ~10 GiB of awareness state in one room. Incoming entries that would
+	// push the total past this cap are silently dropped (matching the
+	// existing oversized-state handling). Zero (the default) disables the
+	// cap. Suggested production value: 100 MiB. See issue #48 vector B.
+	MaxAwarenessBytesPerRoom int64
+
+	// MaxAwarenessClientsPerRoom caps the number of DISTINCT awareness client
+	// entries tracked in one room (live presence plus retained removal
+	// tombstones). Without it a peer can invent unbounded client IDs — including
+	// null-state entries, which bypass MaxAwarenessBytesPerRoom — to exhaust
+	// memory. Previously-unseen client IDs past this cap are dropped. Zero (the
+	// default) disables the cap. Suggested production value: 10,000.
+	MaxAwarenessClientsPerRoom int
+
+	// AwarenessExpiry, when > 0, starts a per-room background sweep that marks a
+	// remote client's presence as removed if no update for it arrives within this
+	// duration. It reclaims "ghost" presence from peers that died silently
+	// (mobile sleep, NAT timeout, half-open TCP) without a clean disconnect.
+	// Zero (the default) disables auto-expiry. The sweep goroutine is stopped
+	// when the room is evicted.
+	//
+	// Set this comfortably ABOVE the clients' presence keep-alive interval, or a
+	// still-connected client will be expired between its keep-alives. Yjs clients
+	// re-announce local presence roughly every 15s (half the y-protocols 30s
+	// outdated-timeout), and that re-announce — including for a peer attached to
+	// another cluster node, since awareness is relayed — refreshes the entry's
+	// last-update time here. The default suggested value 30s leaves ample margin;
+	// values at or below ~15s risk flapping live peers offline.
+	AwarenessExpiry time.Duration
+
+	// Has unexported fields.
+}
+    Server is a net/http-compatible WebSocket handler. Each distinct room name
+    maps to an independent Yjs document.
+
+func NewServer() *Server
+    NewServer returns a new Server with an empty room store and no persistence.
+
+func NewServerWithPersistence(p PersistenceAdapter) *Server
+    NewServerWithPersistence returns a Server that loads and stores room state
+    via the given PersistenceAdapter on every room creation and transaction.
+
+func (s *Server) Apply(
+	ctx context.Context,
+	room string,
+	fn func(doc *crdt.Doc, transact func(func(*crdt.Transaction))),
+) error
+    Apply auto-creates the room if needed, runs fn with a bound transact helper,
+    captures the update(s) produced by fn's transaction(s), and fans the result
+    out to all connected peers.
+
+    fn MUST call transact() to mutate the doc. Calls to doc.GetText, doc.GetMap,
+    doc.GetXmlFragment, etc. must happen OUTSIDE transact(): these acquire the
+    doc's write lock, which transact() already holds, so calling them inside
+    would deadlock.
+
+    fn should be fast — it runs inside the doc's write lock and blocks all peer
+    reads and writes to the room for the duration.
+
+    fn must not spawn goroutines that call transact after fn returns. Any
+    such late transact invocation will commit to the doc (the origin is still
+    recognized by the private OnUpdate listener until the deferred unsub fires)
+    but its delta will not be captured or broadcast — Apply's captured-snapshot
+    happens immediately after fn returns. The doc state will drift from live
+    peers in the same way an unapplied BroadcastUpdate does.
+
+    ctx is checked once at entry and not re-checked after fn returns. Once fn's
+    transaction commits, the update has already been queued to persistence
+    via the existing OnUpdate hook. Aborting the broadcast on late context
+    cancellation would leave live peers out of sync with persisted state — the
+    same hazard warned about on BroadcastUpdate. Context cancellation during
+    fn is therefore a best-effort signal; the transaction completes unless fn
+    itself observes ctx and returns early.
+
+    IMPORTANT: if fn calls doc.Transact directly (bypassing the supplied
+    transact helper), the delta is NOT captured and Apply returns ErrNoChanges
+    even though the doc has been mutated. This is a contract violation, but the
+    behavior is well-defined.
+
+    IMPORTANT: ErrUpdateTooLarge is post-hoc. The size check runs after the
+    transaction commits and after persistence has enqueued the update. On this
+    error the server's doc reflects fn's mutation and the update IS persisted,
+    but peers do NOT see it. This creates the same divergence hazard as a
+    BroadcastUpdate without ApplyUpdateV1. Callers who set MaxUpdateBytes should
+    size-bound fn's effects explicitly or prepare to reconcile via a sync step
+    1/2 exchange.
+
+    NOTE: a panic inside fn propagates to the caller. The OnUpdate subscription
+    is cleaned up via defer, so no listener leaks. Starting in v1.1.1,
+    Doc.Transact is panic-safe: the doc lock is released and observers fire
+    with whatever partial state fn committed before the panic. Apply therefore
+    broadcasts that partial state to peers and triggers persistence before
+    re-raising the panic. Callers should still avoid panicking fn bodies in
+    production because the doc is left with unrolled-back partial mutations;
+    recover and either reconcile via sync or recreate the doc from persistence.
+
+func (s *Server) AttachRelay(r cluster.Relay) error
+    AttachRelay binds a cluster.Relay to this server so that local document and
+    awareness changes are mirrored to other server nodes, and remote changes
+    are injected into local rooms. It must be called once, before the server
+    begins serving connections; once a relay is attached a second call returns
+    ErrRelayAlreadyAttached.
+
+    AttachRelay starts the relay (relay.Start(ctx, s)) with a context that is
+    cancelled when Server.Shutdown is called. If relay.Start returns an error
+    the server is left UNATTACHED (s.relay stays nil) and the call may be
+    retried — it does not latch a partial attach. Rooms that become resident
+    after attach are wired automatically (doc.OnUpdate + awareness.OnUpdate →
+    that room's own outbound lane, drained by its own worker → Publish), so a
+    relay that is slow for one room cannot stall publishing for any other room
+    (#187); the echo guard drops changes whose origin is the relay sentinel.
+
+    Relay lifetime: the CALLER owns the relay and must Close() it once every
+    attached server is done with it. Server.Shutdown only stops THIS server's
+    delivery (it cancels the relay context); it does NOT Close the relay,
+    because a single relay is commonly shared across multiple in-process Servers
+    (the documented MemRelay pattern) and Closing it would stop delivery for all
+    of them.
+
+func (s *Server) BroadcastUpdate(ctx context.Context, room string, update []byte) error
+    BroadcastUpdate fans out a pre-encoded V1 update to all peers currently
+    connected to the named room. It does NOT apply the update to the server's
+    doc; callers who want the server's state to reflect the broadcast must
+    call crdt.ApplyUpdateV1 first (or use Apply). Failing to do so creates
+    divergence: live peers see the update, but peers joining after the broadcast
+    receive the server's stale state via sync step 2.
+
+    The update is checked first by decoding it into a scratch document;
+    bytes that do not decode return ErrInvalidUpdate. The check does not apply
+    MaxPendingItems: decoded without the room's state, an incremental update
+    parks every item that depends on that state, and the room's document,
+    which holds that state, enforces MaxPendingItems when it applies the update.
+
+    Peer write failures during fan-out do not produce an error: writes are
+    dispatched in goroutines with a per-write deadline (writeTimeout), matching
+    the existing peer-broadcast path. A slow peer cannot block the broadcast to
+    other peers.
+
+func (s *Server) CloseRoom(name string, force bool) error
+    CloseRoom removes the named room from the server. Drains the room's
+    persistence write queue and deletes the room from the server's map so that
+    subsequent GetDoc / BroadcastUpdate / Apply calls do not see it.
+
+    If peers are connected:
+      - force=false: returns ErrRoomHasPeers without modifying state.
+      - force=true: closes each peer connection, waits for disconnect handlers
+        to run, then deletes the room.
+
+    CloseRoom is primarily intended for releasing rooms created by Apply that
+    never accumulated peer connections. In eager-evict mode (RoomIdleTimeout ==
+    0) such rooms linger until process exit without it; with RoomIdleTimeout > 0
+    the idle sweeper reclaims them once they have been idle that long.
+
+func (s *Server) GetAwareness(room string) (*awareness.Awareness, bool)
+    GetAwareness returns the *awareness.Awareness for the given room, or (nil,
+    false) if no room with that name is currently resident in the server.
+
+    A room becomes resident once the first peer connects or an Apply call
+    auto-creates it, and is evicted when the last peer disconnects (or CloseRoom
+    is called). The returned pointer is owned by the server; callers must
+    serialise access through the *awareness.Awareness public methods, all of
+    which are internally synchronised.
+
+    This accessor exists so external coordinators (e.g. a cluster relay)
+    can merge inbound awareness updates into the canonical per-room state.
+    It mirrors GetDoc, which exposes the room's *crdt.Doc.
+
+func (s *Server) GetDoc(name string) *crdt.Doc
+    GetDoc returns the document for the given room, or nil if no peer has
+    connected to that room yet.
+
+    A room that is still loading (its off-lock LoadDoc + decode + OnLoadDocument
+    has not finished; #182) is reported as not-yet-present — GetDoc returns
+    nil rather than block or expose a doc that is being mutated by the loader.
+    This matches the documented "no room yet" contract: the result is an
+    immediately-stale snapshot. Once the load completes, GetDoc returns the doc;
+    if the load failed, the room was removed and GetDoc returns nil.
+
+func (s *Server) Inject(ctx context.Context, in cluster.Inbound) error
+    Inject applies a remote change delivered by the relay. It satisfies
+    cluster.Sink. KindSync updates are applied to the room's doc with the relay
+    sentinel origin (so the local doc.OnUpdate observer does NOT re-publish
+    them) and rebroadcast to local peers via BroadcastUpdate. KindAwareness
+    updates are merged into the room's awareness with the sentinel origin;
+    the awareness fan-out to peers is driven by the awareness OnUpdate path the
+    server already runs for local peers — but inbound merges fire OnUpdate with
+    the sentinel origin, which the relay observer drops, so we additionally fan
+    the awareness update out to local peers here.
+
+    Inject auto-creates the room if it is not yet resident, so a node that has
+    no local peers for a room still materialises the converged state (matching
+    how a fresh peer would receive it via sync step-2 once it connects).
+
+func (s *Server) RelayStats() RelayStats
+    RelayStats returns a snapshot of outbound relay counters, safe to call
+    concurrently — including when no relay is attached (all zeroes) — and
+    never touching the Transact commit path (it is a polled diagnostic; see the
+    package invariant that nothing on doc.OnUpdate/awareness.OnUpdate may gain
+    new work because of this method's existence).
+
+    Guarantee: Coalesced/AwarenessSuperseded/HardDrops are MONOTONIC across
+    sequential calls (never decrease) but not guaranteed EXACT — mirroring
+    cluster/redis's Relay.Stats(), including its accepted gaps. Dropped is
+    exact (a single atomic counter) and therefore also monotonic. There are TWO
+    distinct sources of undercount, both benign (never an overcount, never a
+    decrease relative to any total already returned):
+
+     1. (Narrow race) A straggling Push that lands on a lane by name
+        (relayLaneFor) after stopRelayLane/ensureRelayLane has already
+        folded that lane's counters into s.relayRetired and dropped it from
+        s.relayLanes contributes to the counters of a lane nothing will ever
+        read again.
+
+     2. (ROUTINE, not narrow — happens on every retirement of a lane with a
+        backlog) Both fold sites read l.lane.Stats() BEFORE closing l.done,
+        i.e. before the worker's own final drainRelayLane runs. If more than
+        one KindSync entry is still queued at that moment, the final drain's
+        TakeSync call merges them and increments Coalesced on l itself (see
+        TakeSync's doc) — AFTER the fold already captured l's stats and AFTER
+        l was removed from s.relayLanes, so that increment lands on a lane
+        object nothing will ever read again either. Unlike gap 1, this requires
+        no adversarial timing: any retirement of a lane whose backlog has
+        more than one pending entry hits it. Fixing it would mean folding
+        AFTER the final drain instead of before, which would require this
+        synchronous fold path to wait on the worker's own goroutine — trading
+        stopRelayLane's/ensureRelayLane's current non-blocking teardown for a
+        wait of unbounded-by-relay-latency duration, which is a worse trade than
+        an occasional missed Coalesced count on an already-degraded lane.
+
+    Monotonicity requires holding s.relayLanesMu for THIS METHOD'S ENTIRE
+    computation, not just the map snapshot — an earlier, narrower-locking
+    draft of this method left a genuine three-call race, identical in
+    shape to the one cluster/redis's Relay.Stats() doc documents in full:
+    (1) call A takes the lock, reads s.relayRetired (say 0, nothing retired
+    yet) and the live map (including lane L for room "r"), then releases the
+    lock before summing; (2) stopRelayLane(r, L) runs: takes the write lock,
+    folds L's current counters (say Coalesced=50) into s.relayRetired (now 50),
+    deletes L from the map, releases the lock; (3) call A, now lockless,
+    calls L.lane.Stats() through its own stale reference (the Lane object
+    itself is still valid Go memory even though it is no longer reachable from
+    s.relayLanes) and happens to read 50 there too (nothing pushed more onto it
+    in between) — call A returns retired(0, read in step 1) + 50 (from L) = 50,
+    which looks fine in isolation; (4) but a LATER call B takes the lock,
+    reads s.relayRetired = 50 (already folded) and finds L no longer in the map,
+    so it never adds L's contribution again — call B also returns 50, so this
+    particular interleaving is not itself a visible decrease. The version that
+    IS visible: if step 3's stale L.lane.Stats() read happens BEFORE step 2's
+    fold captures a value that is later increased further by a straggling Push
+    (see enqueueRelayOutbound's doc for exactly that straggler), call A can
+    return a total that already reflects that straggler's contribution while a
+    later call B, seeded only from the smaller retired snapshot stopRelayLane
+    folded in, returns less — a real decrease across sequential calls.
+    Holding s.relayLanesMu across the WHOLE computation below closes this:
+    stopRelayLane (which needs the write lock) cannot run between this method's
+    retired-read and its per-lane reads, so every value this call sums is
+    one that a later call, seeded from the resulting retired total, can only
+    match or exceed. Taking only the RLock side (not the full write lock) is
+    sufficient: this method never mutates s.relayLanes or s.relayRetired, and
+    RWMutex's readers-block-writer semantics are all that is required to keep
+    stopRelayLane (write side) from interleaving with this method's read side.
+
+    Deadlock/stall trace: this method holds s.relayLanesMu (read) for its
+    entire computation, including every live lane's l.lane.Stats() call. That
+    used to be a genuine problem, not just a deadlock risk: relaylane.Lane's
+    Push and TakeSync both hold the LANE's own mutex across a potentially
+    slow crdt.MergeUpdatesV1 call (see collapseLocked's doc), so an earlier
+    version of Lane.Stats() that also took that mutex could BLOCK this method's
+    RLock hold on room A's in-flight merge — and because Go's sync.RWMutex
+    blocks new readers behind a pending writer, a concurrent stopRelayLane/
+    ensureRelayLane (write side) queuing behind that stall would then also
+    block enqueueRelayOutbound's relayLaneFor RLock for EVERY OTHER room,
+    reintroducing exactly the cross-room commit-path coupling #187 exists
+    to remove — bounded (it resolves once room A's merge finishes) and not a
+    deadlock, but real coupling in the surface built to observe the absence
+    of coupling. relaylane.Lane.Stats() is now lock-free (three atomic loads,
+    see its doc), so this cannot happen: this method's RLock hold is bounded
+    purely by "iterate len(s.relayLanes) lanes, one atomic load each", never by
+    anything any lane's Push/TakeSync is doing. With that resolved, the actual
+    lock-acquisition graph is: this method and stopRelayLane/ensureRelayLane
+    (write side, for their retired-fold) are the only holders of s.relayLanesMu,
+    and NOTHING they do while holding it can block — reading atomics,
+    deleting/inserting a map entry, and (for the write side) close(prev.done)/go
+    relayLaneWorker(...) are all outside the lock already. relayLaneFor takes
+    s.relayLanesMu alone. Push (the commit-path hot loop), the worker's drain
+    (TakeSync/TakeAwareness), and publishRelay take only a Lane's own mutex and
+    never s.relayLanesMu. So there is no lock anywhere that nests INSIDE another
+    lock anymore except relayLanesMu wrapping a non-blocking atomic read — no
+    cycle, hence no deadlock, and no more cross-room stall either.
+
+func (s *Server) Rooms() []string
+    Rooms returns the names of all rooms currently resident in the server, in
+    unspecified order. The returned slice is a fresh copy; the caller owns it.
+
+    The result is an immediately-stale snapshot — a room may be created or
+    evicted concurrently. Intended for observability and for a cluster relay to
+    enumerate the rooms it should subscribe to; do not use as a synchronization
+    primitive.
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request)
+    ServeHTTP upgrades the request to WebSocket and runs the peer sync loop.
+    Room name is taken from the {room} path variable (Go 1.22 ServeMux) or falls
+    back to the last path segment.
+
+    Cancelling the request context ends the connection. If the context was
+    cancelled with a cause (context.WithCancelCause) that implements CloseCode()
+    (int, string), directly or wrapped, ServeHTTP first sends the peer a close
+    frame with that code and reason, so an embedder can end one session with an
+    application close code (4000–4999) such as "session revoked". Only 1000 and
+    3000–4999 are sent; the reason is truncated to 123 bytes and invalid UTF-8
+    is dropped from it. The peer's input is ignored from the cancel on. Any
+    other cause, or an unsendable code, closes the socket without a close frame,
+    as before.
+
+func (s *Server) Shutdown(ctx context.Context) error
+    Shutdown closes all active peer connections and waits for their goroutines
+    to exit or for ctx to expire. Call this during server shutdown to prevent
+    goroutine leaks and ensure in-flight operations complete cleanly.
+
+type SlowPeerPolicy int
+    SlowPeerPolicy selects how the server reacts when a peer's broadcast write
+    queue overflows.
+
+const (
+	// SlowPeerDisconnect closes the slow peer's connection, forcing a
+	// reconnect-and-resync. Default; preserves the original behavior.
+	SlowPeerDisconnect SlowPeerPolicy = iota
+	// SlowPeerResync keeps the connection open: only the overflowing update is
+	// dropped and the peer is flagged. Its existing backlog is left to drain
+	// normally; once the write queue is empty the peer is re-synced in place with
+	// a full-state SyncStep2 (plus current awareness), which supersedes any stale
+	// deltas that were still queued. Avoids reconnect churn for transiently-slow
+	// peers while still converging.
+	SlowPeerResync
+)
+type StatelessHook func(info StatelessInfo)
+    StatelessHook is called when a peer sends a Hocuspocus Stateless or
+    BroadcastStateless message. The hook is purely informational — it runs
+    after any broadcast fan-out has already happened and its return value has
+    no effect on the server. Use it to surface out-of-band signals (Tiptap
+    comments, custom presence metadata, application heartbeats) to the embedding
+    application.
+
+    The hook is invoked on the peer's read goroutine; long-running work should
+    be dispatched to a separate goroutine to avoid blocking subsequent message
+    processing for that peer.
+
+type StatelessInfo struct {
+	// Room is the room name the message arrived on.
+	Room string
+	// Payload is the UTF-8 string carried by the stateless message.
+	// Empty payloads are valid (Hocuspocus does not require non-empty).
+	Payload string
+	// IsBroadcast reports whether the message arrived as
+	// BroadcastStateless (tag 6) rather than plain Stateless (tag 5).
+	// When true the server has already fanned the payload out to all
+	// other peers in the room as a Stateless (tag 5) frame by the time
+	// the hook fires.
+	IsBroadcast bool
+}
+    StatelessInfo is passed to Server.OnStateless when a Hocuspocus Stateless
+    (#55, tag 5) or BroadcastStateless (#55, tag 6) message arrives from a peer.
+    Additional fields may be added in future versions; callers must not rely on
+    the struct being fixed-size.
+
+type VersionableAdapter interface {
+	SaveVersion(ctx context.Context, room, label string) (int64, error)
+}
+    VersionableAdapter is an optional extension to PersistenceAdapter.
+    When the adapter implements it AND Server.AutoVersionEvery > 0, the server
+    asks it to capture a labelled point-in-time version of a room's state, so an
+    application gets a user-facing version history without driving one itself.
+
+    The distinction from CompactableAdapter matters: Compact collapses the
+    update log (a durability/space concern), while SaveVersion records a version
+    a human would want to browse and restore. An adapter typically implements
+    this over persistence.SnapshotStore.
+
+    Cadence and the anti-churn guarantee: SaveVersion is called from the room's
+    persistence worker, at most once per AutoVersionEvery per room, and ONLY
+    when the room actually changed since the last version. A quiet room is never
+    versioned. This is deliberate: versioning per update is what makes a history
+    panel unusable. One final version is also captured on room unload if there
+    were changes after the last one, so a session's end state is not lost.
+
+    Like Compact, SaveVersion is invoked from the room's persistence worker
+    goroutine, serialised with StoreUpdate for that room, so implementations
+    need no extra locking against concurrent writes to the same room.
+    It is best-effort: a returned error (or panic) is logged and never aborts
+    persistence. Retention (how many versions to keep) is the adapter's concern.
+
+    It is invoked with context.Background() (not cancelled by Server.Shutdown),
+    so a slow SaveVersion delays that room's teardown, exactly as Compact does.
+

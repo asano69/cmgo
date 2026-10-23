@@ -1,0 +1,245 @@
+package awareness // import "github.com/reearth/ygo/awareness"
+
+Package awareness implements the Yjs awareness protocol for ephemeral state such
+as user presence, cursor positions, and selections.
+
+Awareness state is not persisted, not replayed on reconnect, and expires after a
+period of inactivity. It is separate from document updates.
+
+Reference: https://github.com/yjs/y-protocols/blob/master/awareness.js
+
+# Quick start
+
+    a := awareness.New(clientID)
+    a.SetLocalState(map[string]any{"name": "Alice", "cursor": 42})
+    a.OnChange(func(evt awareness.ChangeEvent) {
+        // react to added/updated/removed peers
+    })
+    update := a.EncodeUpdate(nil)
+    // send update to peers; peers call a.ApplyUpdate(update, origin)
+
+See the Example* functions for canonical usage patterns.
+
+# Stability
+
+ygo follows semantic versioning. The v1.x public API is considered stable:
+new functionality lands as minor releases; bug fixes as patch releases; breaking
+changes are deferred to v2.
+
+CONSTANTS
+
+const DefaultTimeout = 30 * time.Second
+
+VARIABLES
+
+var ErrStateTooLarge = errors.New("awareness: client state exceeds maximum size")
+    ErrStateTooLarge is returned when a single client state exceeds
+    maxAwarenessStateBytes.
+
+var ErrTooManyClients = errors.New("awareness: update exceeds maximum client count")
+    ErrTooManyClients is returned when an update claims more clients than
+    maxAwarenessClients.
+
+
+TYPES
+
+type Awareness struct {
+	// Has unexported fields.
+}
+    Awareness tracks ephemeral peer state.
+
+func New(clientID uint64) *Awareness
+    New creates an Awareness instance for the given client.
+
+func (a *Awareness) ApplyUpdate(update []byte, origin any) error
+    ApplyUpdate decodes an incoming awareness update and merges it.
+    Only updates with a higher clock than the current one are applied.
+    Returns ErrTooManyClients if the update claims more than maxAwarenessClients
+    entries, or ErrStateTooLarge if any single state JSON exceeds
+    maxAwarenessStateBytes.
+
+func (a *Awareness) ApplyUpdateContext(ctx context.Context, update []byte, origin any) error
+    ApplyUpdateContext is the context-aware variant of ApplyUpdate. If ctx is
+    already cancelled, the update is NOT applied and ctx.Err() is returned.
+    Otherwise the update is applied and the underlying ApplyUpdate's error (or
+    nil) is returned.
+
+func (a *Awareness) ClientID() uint64
+    ClientID returns the local client ID.
+
+func (a *Awareness) Destroy()
+    Destroy stops the auto-expiry goroutine (if started) and releases associated
+    resources. Safe to call more than once.
+
+func (a *Awareness) EncodeUpdate(clientIDs []uint64) []byte
+    EncodeUpdate encodes the current state of the given client IDs into a binary
+    awareness update message. Pass nil to encode all known clients, including
+    those with a nil (removed) State, which encodes as JSON null and signals
+    removal to peers.
+
+func (a *Awareness) GetLocalState() map[string]any
+    GetLocalState returns the local client's current state (nil if not set or
+    removed).
+
+func (a *Awareness) GetStates() map[uint64]ClientState
+    GetStates returns a snapshot of all known active client states. Removed
+    clients (State == nil) are excluded.
+
+func (a *Awareness) Heartbeat()
+    Heartbeat re-emits the local client's current state at an incremented clock
+    so peers learn that we're still alive even when the state hasn't changed.
+    No-op when no local state is set or when the local client has been removed
+    (state == nil).
+
+    Typical use is to schedule periodic calls alongside StartAutoExpiry on
+    peers — they expire clients that go quiet, this advertises that we haven't.
+    Matches Yjs JS's constructor interval which re-emits local state every
+    outdatedTimeout/2.
+
+    OnUpdate observers ARE fired (the clock advanced); OnChange observers are
+    not (the state content is unchanged). Matches Yjs, whose interval re-emits
+    local state via setLocalState and emits `update` but not `change`.
+
+    Added in v1.11.0 (#73 vector C5).
+
+func (a *Awareness) Meta(clientID uint64) (ClientMeta, bool)
+    Meta returns the clock and last-updated time for a known client, including
+    remote tombstones (Yjs/yrs retain meta for removed clients). LastUpdated
+    is the last-applied time for an active client, or the tombstone time for
+    a remote tombstone; a local tombstone (our own leaving state) has a valid
+    Clock with a zero LastUpdated. Returns ok=false only for never-seen clients.
+
+func (a *Awareness) OnChange(fn func(ChangeEvent)) func()
+    OnChange registers a callback invoked whenever client state content changes
+    (added, removed, or content-differing update). For an event on every applied
+    entry including heartbeats, use OnUpdate. Returns an unsubscribe function.
+
+func (a *Awareness) OnUpdate(fn func(UpdateEvent)) func()
+    OnUpdate registers a callback invoked on every applied awareness entry,
+    including heartbeats (where OnChange does not fire). Returns an unsubscribe
+    function. Observers are not cleared by Destroy (matches OnChange).
+
+func (a *Awareness) PurgeTombstones(grace time.Duration) int
+    PurgeTombstones reclaims removal tombstones (clients with a null State) that
+    became tombstones longer than grace ago, freeing both their slot against
+    SetMaxClients and their memory. Without it, a high-churn room accumulates
+    tombstones without bound — each retained entry counts toward the client cap,
+    so the room can eventually refuse new, legitimate clients — and every full
+    EncodeUpdate(nil) keeps re-broadcasting them as null.
+
+    grace MUST exceed the RemoveExpired timeout (and the provider's full-state
+    re-broadcast interval): a tombstone's clock is what encodes removals and
+    rejects stale re-adds, so it must outlive normal update reordering before
+    it is forgotten. A non-positive grace is a no-op. The local client is never
+    purged. Purging fires no observer event — a purged tombstone was either
+    already signalled removed or never signalled present, so no consumer is
+    tracking it (GetStates already hides tombstones).
+
+    Cross-peer note: after a tombstone is forgotten, a delayed low-clock update
+    for that id is accepted as a new client, whereas a peer that has not yet
+    purged would drop it. This transient divergence self-heals on the next
+    broadcast and matches y-protocols' "forget after outdatedTimeout" semantics;
+    awareness is best-effort presence, not a convergent CRDT.
+
+    Returns the number of tombstones reclaimed.
+
+func (a *Awareness) RemoveExpired(timeout time.Duration)
+    RemoveExpired removes clients whose last update is older than timeout.
+    Only active clients (with non-nil State) are tracked in meta and can expire.
+
+    The local client is exempt: peers can't reliably tell whether we've
+    gone silent, so it's our job to broadcast presence via SetLocalState or
+    Heartbeat. Self-expiry would create false offline signals on quiet rooms.
+    Matches y-protocols / yrs behavior (#73 vector C4).
+
+    Expiring a client converts it to a retained null-state tombstone (its clock
+    is kept for removal encoding and the clock gate); it does NOT free the
+    entry. Callers driving expiry manually should pair this with PurgeTombstones
+    to reclaim aged tombstones, or use StartAutoExpiry, which runs both stages.
+
+func (a *Awareness) SetLocalState(state map[string]any)
+    SetLocalState updates the local client's state and increments the clock.
+    Passing nil removes the local client from the awareness set.
+
+func (a *Awareness) SetLocalStateContext(ctx context.Context, state map[string]any) error
+    SetLocalStateContext is the context-aware variant of SetLocalState. If ctx
+    is already cancelled, the state is NOT updated and ctx.Err() is returned.
+    Otherwise the state is updated and nil is returned.
+
+    Like TransactContext (see crdt.Doc.TransactContext), mid-call ctx
+    cancellation is not interrupted — the operation itself is short and
+    uninterruptible. This method provides cooperative entry-point cancellation
+    only.
+
+func (a *Awareness) SetMaxBytes(n int64)
+    SetMaxBytes caps the cumulative byte size of awareness state across all
+    remote clients merged via ApplyUpdate. Incoming entries that would push
+    the total past the cap are silently dropped (treated as null) rather than
+    rejected with an error — matches the existing pattern for oversized-state
+    handling so a single misbehaving peer cannot cause an entire room's
+    awareness merge to fail.
+
+    A value of 0 (the default) disables the cap. Local state set via
+    SetLocalState is not counted; the cap is intended to constrain untrusted
+    wire input only. See issue #48 vector B.
+
+    Set this once at construction time; changes while concurrent updates are
+    being processed are safe (the field is read under a.mu).
+
+func (a *Awareness) SetMaxClients(n int)
+    SetMaxClients caps the number of distinct client entries this Awareness
+    will track — live presence plus retained removal tombstones. Once the cap is
+    reached, ApplyUpdate refuses previously-unseen client IDs; clients already
+    tracked can still update and be removed. This bounds memory against a peer
+    that invents unbounded client IDs to exhaust the room — including null-state
+    entries, which are NOT subject to the byte cap (see SetMaxBytes) and so
+    would otherwise grow the states map without limit.
+
+    A value of 0 (the default) disables the cap. Local state set via
+    SetLocalState is exempt — the local client is always allowed. Suggested
+    production value: a few thousand to tens of thousands per room.
+
+    Set this once at construction time; changes while concurrent updates are
+    being processed are safe (the field is read under a.mu).
+
+func (a *Awareness) StartAutoExpiry(timeout time.Duration) func()
+    StartAutoExpiry starts a background goroutine that periodically runs
+    both awareness-cleanup stages: RemoveExpired(timeout) to tombstone silent
+    clients, then PurgeTombstones(2*timeout) to reclaim tombstones whose removal
+    has aged out (so a high-churn room does not accumulate tombstones against
+    the client cap). The goroutine ticks at timeout/2 so that clients are
+    expired within one tick period after their deadline. The returned function
+    stops the goroutine; it must be called to avoid a goroutine leak. The stop
+    function is also stored internally and will be called by Destroy.
+
+type ChangeEvent struct {
+	Added   []uint64 // client IDs newly seen
+	Updated []uint64 // client IDs whose state changed
+	Removed []uint64 // client IDs whose state was set to null
+	Origin  any
+}
+    ChangeEvent is delivered to observers when states change.
+
+type ClientMeta struct {
+	Clock       uint64
+	LastUpdated time.Time
+}
+    ClientMeta is the per-client metadata returned by Meta.
+
+type ClientState struct {
+	Clock uint64
+	State map[string]any // nil means the client was removed
+}
+    ClientState holds the clock and decoded state for one peer.
+
+type UpdateEvent struct {
+	Added   []uint64
+	Updated []uint64
+	Removed []uint64
+	Origin  any
+}
+    UpdateEvent is delivered to OnUpdate observers on every applied awareness
+    entry, including same-content heartbeat re-emits at a bumped clock. Same
+    shape as ChangeEvent; a distinct type prevents accidentally crossing the two
+    callback kinds.
+
