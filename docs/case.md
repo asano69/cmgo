@@ -1,6 +1,6 @@
 # 別プロジェクトでygoの使われ方の事例
 
-importしているパッケージ:
+事例がimportしていたパッケージは以下の二種類
 - `github.com/reearth/ygo/crdt`
 - `github.com/reearth/ygo/provider/websocket`
 
@@ -73,7 +73,7 @@ importしているパッケージ:
 
 ### ygo 内部の挙動に依存している点
 
-自前実装で再現が必要になる前提です(`ydoc.go` のコメントより)。
+自前実装で再現が必要になる前提です
 
 - `Server.PersistCoalesceWindow` / `PersistCoalesceMaxWait`(既定 2s / 10s)による `StoreUpdate` の間引き
 - 最後のピアが切断したときの flush-before-evict
@@ -84,11 +84,11 @@ importしているパッケージ:
 
 置き換えの対象は大きく3層に分かれます。
 
-1. **CRDT コア**: `Doc`、`YText`(`Insert`/`Delete`/`Observe`/`ToString`)、update のエンコード/適用/マージ。XmlFragment は migrate スクリプトだけなので、置き換え後は不要にできます。
+1. **CRDT コア**: `Doc`、`YText`(`Insert`/`Delete`/`Observe`/`ToString`)、update のエンコード/適用/マージ。
 2. **同期プロトコル**: y-websocket 互換のサーバ(`ServeHTTP`、ルーム管理、`GetDoc`、`CloseRoom`、`Shutdown`、`OnLoadDocument`)。
 3. **永続化アダプタ**: 上記インターフェイスとコアレスキングの挙動。
 
-フロントエンドは `y-websocket` v2 と `yjs` 13.6 を使っているので、自前サーバが話すプロトコルはこれに合わせる必要があります。また `unseen.ts` が Yjs の内部構造(`_start`、item の `id`/`length`/`deleted`/`countable`)に、`lineId.ts` が item の `client:clock` に依存しています。こちらはクライアント側なので影響しませんが、サーバが生成する update のバイナリ形式は Yjs V1 互換である必要があります。
+フロントエンドは `y-websocket` v2 と `yjs` 13.6 を使っていた。
 
 ## 4. `go doc` で確認するコマンド
 
@@ -103,5 +103,3 @@ go doc github.com/reearth/ygo/provider/websocket Server
 go doc github.com/reearth/ygo/provider/websocket PersistenceAdapter
 go doc github.com/reearth/ygo/provider/websocket PersistenceAdapterContext
 ```
-
-提示されたファイルに現れた範囲での一覧なので、提示されていないファイル(`Hijack` まわりのテスト用ヘルパーや `yjs_auth_test.go` など)で追加の呼び出しがある可能性は残ります。念のため `grep -rn "ygo" --include='*.go'` で確認してください。

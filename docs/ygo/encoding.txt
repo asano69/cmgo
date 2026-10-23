@@ -1,0 +1,32 @@
+package encoding // import "github.com/reearth/ygo/encoding"
+
+Package encoding implements the lib0 binary encoding format used by Yjs.
+
+This is a variable-length binary codec with no external dependencies. It is the
+foundation for all wire-format serialisation in ygo.
+
+Reference: https://github.com/dmonad/lib0
+
+var ErrUnexpectedEOF = errors.New("encoding: unexpected end of input") ...
+var ErrDepthExceeded = errors.New("encoding: nested Any exceeds maximum depth")
+var ErrVarIntOutOfRange = errors.New("encoding: VarInt magnitude exceeds lib0 55-bit range")
+func EncodeBytes(fn func(*Encoder)) (out []byte)
+func PutEncoder(e *Encoder)
+type BigInt int64
+type Decoder struct{ ... }
+    func NewDecoder(b []byte) *Decoder
+type Encoder struct{ ... }
+    func GetEncoder() *Encoder
+    func NewEncoder() *Encoder
+type IntDiffOptRleDecoder struct{ ... }
+    func NewIntDiffOptRleDecoder(data []byte) *IntDiffOptRleDecoder
+type IntDiffOptRleEncoder struct{ ... }
+type RleByteDecoder struct{ ... }
+    func NewRleByteDecoder(data []byte) *RleByteDecoder
+type RleByteEncoder struct{ ... }
+type StringDecoder struct{ ... }
+    func NewStringDecoder(data []byte) (*StringDecoder, error)
+type StringEncoder struct{ ... }
+type UintOptRleDecoder struct{ ... }
+    func NewUintOptRleDecoder(data []byte) *UintOptRleDecoder
+type UintOptRleEncoder struct{ ... }
