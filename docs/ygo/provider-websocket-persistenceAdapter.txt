@@ -1,0 +1,20 @@
+package websocket // import "github.com/reearth/ygo/provider/websocket"
+
+type PersistenceAdapter interface {
+	// LoadDoc returns the full binary V1 update representing stored state for
+	// the room, or (nil, nil) if no state exists yet.
+	LoadDoc(room string) ([]byte, error)
+	// StoreUpdate is called with each incremental V1 update produced by a
+	// transaction in the room. The adapter is responsible for merging or
+	// appending updates as appropriate for its storage model.
+	StoreUpdate(room string, update []byte) error
+}
+    PersistenceAdapter is implemented by storage backends that want to persist
+    room state across server restarts. It is called on every committed update so
+    implementations should be efficient (e.g. append-only log rather than full
+    re-encode on every write).
+
+    By default the server coalesces bursts of updates and calls StoreUpdate
+    once per debounced batch (a single merged V1 update) rather than once per
+    transaction; see Server.PersistCoalesceWindow.
+

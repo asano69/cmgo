@@ -1,0 +1,17 @@
+package crdt // import "github.com/reearth/ygo/crdt"
+
+type Transaction struct {
+	Origin any  // user-supplied tag forwarded to update observers
+	Local  bool // true when the change originated on this peer
+
+	// Has unexported fields.
+}
+    Transaction batches a set of insertions and deletions into a single atomic
+    operation. Observers fire once per transaction, not once per operation,
+    which keeps event handler overhead proportional to transactions not edits.
+
+func (t *Transaction) Ctx() context.Context
+func (t *Transaction) GetArray(name string) *YArray
+func (t *Transaction) GetMap(name string) *YMap
+func (t *Transaction) GetText(name string) *YText
+func (t *Transaction) GetXmlFragment(name string) *YXmlFragment

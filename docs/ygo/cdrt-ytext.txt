@@ -1,0 +1,21 @@
+package crdt // import "github.com/reearth/ygo/crdt"
+
+type YText struct {
+	// Has unexported fields.
+}
+    YText is a shared rich-text type. Characters are stored as ContentString
+    items; formatting spans are ContentFormat items (which do not count toward
+    logical length).
+
+func NewTextPrelim() *YText
+func (txt *YText) ApplyDelta(txn *Transaction, delta []Delta)
+func (txt *YText) Delete(txn *Transaction, index, length int)
+func (txt *YText) Format(txn *Transaction, index, length int, attrs Attributes)
+func (txt *YText) Insert(txn *Transaction, index int, text string, attrs Attributes)
+func (txt *YText) InsertEmbed(txn *Transaction, index int, embed any, attrs Attributes)
+func (txt *YText) Len() int
+func (txt *YText) Observe(fn func(YTextEvent)) func()
+func (txt *YText) ObserveDeep(fn func(*Transaction)) func()
+func (txt *YText) ToDelta() []Delta
+func (txt *YText) ToJSON() ([]byte, error)
+func (txt *YText) ToString() string

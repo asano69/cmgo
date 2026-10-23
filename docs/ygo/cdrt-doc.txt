@@ -1,0 +1,35 @@
+package crdt // import "github.com/reearth/ygo/crdt"
+
+type Doc struct {
+	// Has unexported fields.
+}
+    Doc is the root of a Yjs collaborative document. All shared types (YArray,
+    YMap, YText, …) live inside a Doc.
+
+func CreateDocFromSnapshot(src *Doc, snap *Snapshot) (*Doc, error)
+func New(opts ...DocOption) *Doc
+func RestoreDocument(doc *Doc, snap *Snapshot) (*Doc, error)
+func (d *Doc) ApplyUpdate(update []byte) error
+func (d *Doc) AutoLoad() bool
+func (d *Doc) ClientID() ClientID
+func (d *Doc) CollectionID() string
+func (d *Doc) Destroy()
+func (d *Doc) EncodeStateAsUpdate() []byte
+func (d *Doc) GUID() string
+func (d *Doc) GetArray(name string) *YArray
+func (d *Doc) GetMap(name string) *YMap
+func (d *Doc) GetSubdocGUIDs() []string
+func (d *Doc) GetSubdocs() []*Doc
+func (d *Doc) GetText(name string) *YText
+func (d *Doc) GetXmlFragment(name string) *YXmlFragment
+func (d *Doc) Load()
+func (d *Doc) OnAfterTransaction(fn func(*Transaction)) func()
+func (d *Doc) OnSubdocs(fn func(SubdocsEvent)) func()
+func (d *Doc) OnUpdate(fn func(update []byte, origin any)) func()
+func (d *Doc) PendingStats() PendingStats
+func (d *Doc) ShouldLoad() bool
+func (d *Doc) StateVector() StateVector
+func (d *Doc) Transact(fn func(*Transaction), origin ...any)
+func (d *Doc) TransactContext(ctx context.Context, fn func(*Transaction), origin ...any) error
+func (d *Doc) TransactContextE(ctx context.Context, fn func(*Transaction) error, origin ...any) error
+func (d *Doc) TransactE(fn func(*Transaction) error, origin ...any) error

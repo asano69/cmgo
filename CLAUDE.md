@@ -1,7 +1,7 @@
 ## 概要
-- cmgoはcodemirror/collabと互換性のあるOTサーバのpure-Go実装です。  
-- yjsのGo実装であるgithub.com/reearth/ygoのAPIを参考にしライブラリの機能を類推しやすくします。docs/ygoにgo docで取得したドキュメントをキャッシュしています。必要に応じて参照してください。
-
+- cmgoはcodemirror/collabと互換性のあるOTサーバのpure-Go実装だ。
+- yjsのGo実装であるgithub.com/reearth/ygoのAPIを参考にしライブラリの機能を類推しやすくする。docs/ygoにgo docで取得したドキュメントをキャッシュした。必要に応じて参照すること。
+- 特に優先して実装したいAPIは、docs/case.mdに記録した。
 
 ## Rules
 

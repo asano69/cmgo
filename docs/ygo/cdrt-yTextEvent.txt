@@ -1,0 +1,9 @@
+package crdt // import "github.com/reearth/ygo/crdt"
+
+type YTextEvent struct {
+	Target *YText
+	Txn    *Transaction
+	Delta  []Delta
+}
+    YTextEvent is emitted after a transaction that modifies a YText.
+

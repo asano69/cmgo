@@ -1,0 +1,362 @@
+package websocket // import "github.com/reearth/ygo/provider/websocket"
+
+type Server struct {
+
+	// AuthFunc, if non-nil, is called before upgrading each incoming WebSocket
+	// connection. Return false to reject the connection; the server responds
+	// with 401 Unauthorized. Use this hook for token validation, session checks,
+	// or IP allow-lists. If nil, all connections are accepted.
+	//
+	// AuthFunc grants read-write access. To grant read-only access, use Authorize
+	// instead — when Authorize is set it takes precedence and AuthFunc is ignored.
+	AuthFunc func(r *http.Request) bool
+
+	// HocuspocusFraming, when true, makes this server read and write the
+	// Hocuspocus docName-prefixed framing: every frame is
+	// VarString(docName) + <y-websocket frame>. Enables real @hocuspocus/provider
+	// interop. One room per connection is still enforced (no multi-document
+	// multiplexing); the inbound docName is read and used only for logging.
+	// Leave false (default) for native y-websocket clients — the two framings
+	// cannot be auto-detected on one endpoint.
+	HocuspocusFraming bool
+
+	// Authorize, if non-nil, is the richer alternative to AuthFunc: it both
+	// accepts/rejects the connection (second return value; false → 401) and
+	// returns a ConnectionConfig describing the accepted connection — notably
+	// whether it is read-only (issue #59). When Authorize is set it takes
+	// precedence over AuthFunc. A read-only peer receives document and awareness
+	// broadcasts but its inbound writes (SyncStep2/Update and awareness updates)
+	// are dropped; it can still request state (SyncStep1 is answered) and query
+	// awareness. Stateless signals are not gated by read-only.
+	Authorize func(r *http.Request) (ConnectionConfig, bool)
+
+	// AllowedOrigins is the list of origins permitted to open WebSocket
+	// connections (C2 — CORS). Each entry is a full origin string, e.g.
+	// "https://example.com". An entry may contain "*" wildcards, each matching
+	// any run of characters: "https://*.example.com" matches any subdomain and
+	// "https://pr-*---web-*.run.app" matches preview hosts. A bare "*" allows any
+	// origin. Matching is case-insensitive.
+	//
+	// If the slice is empty the server falls back to a same-origin check:
+	// the request Origin header must match the HTTP Host header. Non-browser
+	// clients that omit the Origin header are always permitted.
+	//
+	// Security warning: setting AllowedOrigins to "*" disables same-origin
+	// protection and enables Cross-Site WebSocket Hijacking (CSWSH) — a
+	// malicious page that the user visits can open a WebSocket to this
+	// server and act as that user if authentication is carried by a session
+	// cookie. Use "*" only when AuthFunc validates tokens carried explicitly
+	// (bearer tokens in the WebSocket subprotocol or a query parameter), not
+	// when relying on cookie-based auth. See SECURITY.md.
+	AllowedOrigins []string
+
+	// MaxConnections is the server-wide cap on simultaneous WebSocket peers.
+	// Upgrade requests that would exceed this limit are rejected with 503.
+	// Zero (the default) means unlimited (N-H5).
+	MaxConnections int
+
+	// MaxPeersPerRoom is the per-room cap on simultaneous WebSocket peers.
+	// Upgrade requests that would exceed this limit are rejected with 503.
+	// Zero (the default) means unlimited (N-H5).
+	MaxPeersPerRoom int
+
+	// OnInject, if non-nil, is called before every server-side write
+	// (BroadcastUpdate or Apply). Return a non-nil error to refuse the
+	// operation; the error is wrapped and returned to the caller.
+	// For BroadcastUpdate, InjectInfo.UpdateSize is len(update); for
+	// Apply it is 0 (the delta has not yet been produced).
+	OnInject InjectHook
+
+	// OnStateless, if non-nil, is called when a peer sends a Hocuspocus
+	// Stateless (tag 5) or BroadcastStateless (tag 6) message. The hook
+	// is purely informational — for BroadcastStateless the server has
+	// already fanned the payload out to other peers in the room by the
+	// time the hook fires. Use this to surface out-of-band signals
+	// (Tiptap comments, custom presence metadata, application heartbeats)
+	// to the embedding application.
+	OnStateless StatelessHook
+
+	// OnTokenAuth, if non-nil, validates the token from a Hocuspocus in-band
+	// Auth message (tag 2). A nil error accepts the connection and replies
+	// Authenticated (scope from the returned ConnectionConfig.ReadOnly); a
+	// non-nil error replies PermissionDenied(err) and closes with WS 4401.
+	// When nil, tag-2 frames are silently ignored (unchanged legacy behavior).
+	//
+	// OnTokenAuth complements the HTTP-boundary AuthFunc/Authorize; it does not
+	// replace them. IMPORTANT: it is NOT a document-confidentiality gate — the
+	// initial sync is served before any PermissionDenied, so deployments that
+	// must withhold document contents from unauthenticated clients must reject
+	// them at the boundary via AuthFunc/Authorize.
+	OnTokenAuth func(room, token string) (ConnectionConfig, error)
+
+	// OnLoadDocument, if non-nil, is called once per room immediately
+	// after the document has been bootstrapped from the PersistenceAdapter
+	// (or freshly constructed when no adapter is configured) but before
+	// any peer can interact with it. Returning a non-nil error fails room
+	// creation: peer upgrades / Apply / BroadcastUpdate against the room
+	// receive that error wrapped as a room-load failure. Use this to wire
+	// in a custom resolver, decrypt-at-rest, schema-migration check, or
+	// any other one-time per-room setup. (#60)
+	//
+	// As of #182 the hook runs OFF the global room-map lock (s.rmu): the
+	// room is published as a not-yet-ready placeholder under s.rmu, then
+	// LoadDoc + decode + this hook run with s.rmu released. A slow hook
+	// therefore no longer stalls create / lookup / evict for other rooms —
+	// it only delays callers waiting on THIS room's ready barrier. The doc
+	// passed in is owned by the server — retaining a reference past the hook
+	// return is safe as long as the caller serialises access through Transact
+	// / public APIs.
+	OnLoadDocument func(ctx context.Context, room string, doc *crdt.Doc) error
+
+	// OnUnloadDocument, if non-nil, is called once per room immediately
+	// after the room has been evicted from the server's in-memory map.
+	// Fires from both handleDisconnect (last-peer-leaves) and CloseRoom.
+	// Use this to release per-room caches, flush metrics, or notify
+	// downstream systems that the doc is no longer hot. (#60)
+	OnUnloadDocument func(ctx context.Context, room string)
+
+	// OnFirstPeer, if non-nil, fires when a room transitions from 0 to 1
+	// peers — i.e. the first peer just joined this active session of the
+	// document. Useful for warm-up tasks (preloading caches, opening
+	// downstream connections). Fires after the peer has been registered
+	// with the room and after all server locks have been released. ctx is
+	// the WebSocket request context; it is cancelled when the peer's HTTP
+	// request is cancelled. (#60)
+	//
+	// Note: under heavy churn the (OnFirstPeer / OnLastPeer) pair for the
+	// same room may interleave out of strict time order — implementations
+	// must be idempotent against repeated transitions.
+	OnFirstPeer func(ctx context.Context, room string)
+
+	// OnLastPeer, if non-nil, fires when a room transitions from 1 to 0
+	// peers — i.e. the last peer just disconnected. Useful for cool-down
+	// tasks (releasing caches, closing downstream connections, scheduling
+	// the eventual OnUnloadDocument). Fires before OnUnloadDocument when
+	// both apply. ctx is context.Background() — the WS request that owned
+	// the peer has already terminated by this point. (#60)
+	OnLastPeer func(ctx context.Context, room string)
+
+	// MaxUpdateBytes is the maximum size of a single V1 update that
+	// BroadcastUpdate will fan out, or that Apply will produce and
+	// fan out. Zero means use the same 64 MiB default applied to
+	// WebSocket peer frames (maxWSMessageBytes).
+	MaxUpdateBytes int
+
+	// MaxRooms caps the total number of rooms the server will hold at
+	// once, across both peer-upgrade-created and Apply-created rooms.
+	// Zero means unlimited. Enforcement applies uniformly: peer upgrades
+	// past the cap receive HTTP 503; Apply past the cap returns
+	// ErrTooManyRooms.
+	MaxRooms int
+
+	// MaxMessageBytes is the per-message size cap on the WebSocket read path.
+	// Frames larger than this are rejected by the underlying gorilla/websocket
+	// library (which closes the connection with code 1009). Zero (the default)
+	// uses the package default of 64 MiB, which matches Rust yrs-warp's underlying
+	// warp default. Yjs JS's y-websocket inherits ws library's 100 MiB default.
+	//
+	// Lower this for stricter limits in untrusted multi-tenant deployments;
+	// raise it for unusual bulk-sync workloads.
+	MaxMessageBytes int64
+
+	// MessageRateLimit caps the sustained inbound-message rate (messages per
+	// second) for each peer. Zero (the default) means unlimited, preserving
+	// existing behaviour. When set, every peer gets its own token-bucket limiter;
+	// a peer that exceeds it is disconnected (issue #51). Disconnect — rather than
+	// dropping the offending message — is deliberate: silently discarding a CRDT
+	// update would leave that peer permanently diverged.
+	MessageRateLimit rate.Limit
+
+	// MessageRateBurst is the token-bucket burst size paired with
+	// MessageRateLimit (how many messages may arrive back-to-back before the
+	// sustained rate applies). Ignored when MessageRateLimit is zero. Zero or
+	// negative with a non-zero MessageRateLimit defaults to defaultRateBurst.
+	MessageRateBurst int
+
+	// Logger receives structured log entries for connection lifecycle, write
+	// failures, slow-peer disconnects, and persistence errors. nil falls back
+	// to slog.Default(). Most operators want to wire this to their app logger
+	// rather than rely on the default.
+	Logger *slog.Logger
+
+	// PeerWriteQueueSize is the buffer capacity of each peer's broadcast
+	// write queue. When the queue fills (slow peer / dead connection), the
+	// peer is disconnected — forcing them to reconnect and re-sync via the
+	// CRDT's pending-structs machinery. Matches yrs-warp's bounded-broadcast
+	// pattern.
+	//
+	// Zero (the default) uses 512, sized for typical sync workloads.
+	PeerWriteQueueSize int
+
+	// SlowPeerPolicy selects the reaction when a peer's broadcast write queue
+	// overflows: SlowPeerDisconnect (default) closes the connection; SlowPeerResync
+	// keeps it open and re-syncs the peer in place. See SlowPeerPolicy. Like the
+	// other config fields, set it before serving; it is read without
+	// synchronisation and must not be mutated while the server is handling
+	// connections.
+	SlowPeerPolicy SlowPeerPolicy
+
+	// RoomIdleTimeout, when > 0, switches room eviction from eager to lazy
+	// (#183): when the last peer leaves a room, the v1.37.0 durable
+	// flush-before-evict still runs (so pending writes are never lost), but
+	// the room is NOT deleted from the server map — it is stamped idle
+	// (its idleSince timestamp is set) and stays resident, worker and
+	// in-memory doc alive. A rejoin before eviction reuses the warm doc with
+	// no LoadDoc / reload. Actually evicting rooms whose idle time exceeds
+	// this timeout is done by a separate background sweeper; setting this
+	// field alone only stops eager eviction and marks rooms idle — without a
+	// sweeper an idle room simply stays resident indefinitely, which is safe
+	// (just extra memory) but never reclaims it on its own.
+	//
+	// Zero (the default) preserves the original eager-evict behaviour: the
+	// room is deleted from the server map and OnUnloadDocument fires the
+	// instant the last peer disconnects. Like the other config fields, set
+	// this before serving; it is read without synchronisation and must not be
+	// mutated while the server is handling connections.
+	RoomIdleTimeout time.Duration
+
+	// MaxResidentRooms, when > 0, bounds how many IDLE-resident rooms the
+	// server keeps warm at once (#183, G4). When RoomIdleTimeout > 0 an empty
+	// room is not evicted immediately but stamped idle and left resident so a
+	// rejoin reuses the warm doc; without a bound, a workload that touches many
+	// distinct rooms would accumulate them until each individually ages past
+	// RoomIdleTimeout. This cap makes the idle set an LRU: whenever the count of
+	// idle-resident rooms exceeds MaxResidentRooms, the background sweeper evicts
+	// the least-recently-idle rooms first (smallest idleSince) — durably flushing
+	// each before eviction — until the count is back within the bound, even for
+	// rooms that have not yet reached RoomIdleTimeout. Active rooms (with peers)
+	// are never counted or evicted.
+	//
+	// Only meaningful together with RoomIdleTimeout > 0 (only then are rooms
+	// stamped idle and a sweeper started); it is ignored in eager-evict mode.
+	// Zero (the default) means unlimited idle residency. Like the other config
+	// fields, set it before serving; it is read without synchronisation and must
+	// not be mutated while the server is handling connections.
+	MaxResidentRooms int
+
+	// PersistCoalesceWindow controls debounced coalescing of persistence
+	// writes. Buffered updates are merged into a single StoreUpdate rather than
+	// written one-per-update. The window is a debounce: each new update resets
+	// it; see PersistCoalesceMaxWait for the hard ceiling.
+	//
+	//   0  — default (2s): coalescing ON (matches Hocuspocus).
+	//   <0 — disabled: strict one StoreUpdate per update (pre-v1.36 behaviour).
+	//   >0 — debounce window of this duration.
+	//
+	// Only affects servers with a PersistenceAdapter configured. Like the other
+	// config fields, set it before serving; it is read without synchronisation
+	// and must not be mutated while the server is handling connections.
+	//
+	// When disabled (<0), the strict per-update path — like the pre-v1.36
+	// behaviour — uses the cancellable worker context for its shutdown drain,
+	// so a context-respecting adapter may abort the final buffered writes on
+	// shutdown; the default coalescing path flushes the final batch with a
+	// background context and is more durable at shutdown.
+	PersistCoalesceWindow time.Duration
+
+	// PersistCoalesceMaxWait bounds how long a buffered update waits before it is
+	// flushed, measured from the batch's first update (Hocuspocus maxDebounce).
+	// Under sustained editing the debounce window keeps resetting, so flushes
+	// occur every PersistCoalesceMaxWait and durable state can lag live state by
+	// up to this duration. 0 uses the default (10s). The effective value is
+	// clamped to be at least the effective PersistCoalesceWindow, so any value
+	// below the window — including a negative one — resolves to the window
+	// rather than the 10s default (a negative maxWait is NOT a disable switch;
+	// only a negative PersistCoalesceWindow disables coalescing). Ignored when
+	// coalescing is disabled.
+	PersistCoalesceMaxWait time.Duration
+
+	// CompactEvery, when > 0, asks a CompactableAdapter to Compact a room after
+	// every N successful (non-empty) persistence flushes, bounding version
+	// growth for long-lived, always-connected documents. 0 (default) compacts
+	// only on room unload. Ignored when the adapter does not implement
+	// CompactableAdapter, and on the disabled (PersistCoalesceWindow < 0) path
+	// (which has no flush cycle — those deployments get on-unload compaction
+	// only). Like the other config fields, set it before serving; it is read
+	// without synchronisation.
+	CompactEvery int
+
+	// AutoVersionEvery, when > 0, asks a VersionableAdapter to capture a labelled
+	// version of a room at most this often, and only when the room changed since
+	// the last version, giving a user-facing history that does not grow one entry
+	// per edit. A room with no activity is never versioned; a room that changed
+	// after its last version is versioned once more on unload so the session's
+	// end state survives.
+	//
+	// The interval is measured from the previous version (or from worker start),
+	// and is evaluated on persistence flushes rather than on a timer, so it is
+	// checked only when there is something to version. That means the actual gap
+	// between versions is AutoVersionEvery rounded up to the next flush.
+	//
+	// 0 (default) disables auto-versioning entirely. Ignored when the adapter does
+	// not implement VersionableAdapter. Set before serving; read without
+	// synchronisation.
+	AutoVersionEvery time.Duration
+
+	// MaxPendingItems caps the per-document pending-items queue depth. The
+	// queue holds items whose dependencies have not yet arrived, waiting for
+	// out-of-order delivery to resolve. Zero or negative uses the crdt default
+	// (100,000). See crdt.WithMaxPendingItems and issue #46.
+	MaxPendingItems int
+
+	// HandshakeTimeout caps how long a peer may stay connected without sending
+	// any message after the WebSocket upgrade completes. This is the first-line
+	// defense against slow-loris-style attacks where an attacker completes the
+	// handshake on many connections and then sends nothing, holding goroutines
+	// and buffers indefinitely. After the first successful ReadMessage the
+	// deadline is cleared. Zero or negative uses the default (30 seconds).
+	// See #47.
+	HandshakeTimeout time.Duration
+
+	// MaxAwarenessBytesPerRoom caps the cumulative byte size of awareness
+	// state held in one room across all remote clients. Without this cap a
+	// single peer can claim up to maxAwarenessClientsPerPeer (10,000)
+	// clientIDs each holding the maximum per-state size (1 MiB) — up to
+	// ~10 GiB of awareness state in one room. Incoming entries that would
+	// push the total past this cap are silently dropped (matching the
+	// existing oversized-state handling). Zero (the default) disables the
+	// cap. Suggested production value: 100 MiB. See issue #48 vector B.
+	MaxAwarenessBytesPerRoom int64
+
+	// MaxAwarenessClientsPerRoom caps the number of DISTINCT awareness client
+	// entries tracked in one room (live presence plus retained removal
+	// tombstones). Without it a peer can invent unbounded client IDs — including
+	// null-state entries, which bypass MaxAwarenessBytesPerRoom — to exhaust
+	// memory. Previously-unseen client IDs past this cap are dropped. Zero (the
+	// default) disables the cap. Suggested production value: 10,000.
+	MaxAwarenessClientsPerRoom int
+
+	// AwarenessExpiry, when > 0, starts a per-room background sweep that marks a
+	// remote client's presence as removed if no update for it arrives within this
+	// duration. It reclaims "ghost" presence from peers that died silently
+	// (mobile sleep, NAT timeout, half-open TCP) without a clean disconnect.
+	// Zero (the default) disables auto-expiry. The sweep goroutine is stopped
+	// when the room is evicted.
+	//
+	// Set this comfortably ABOVE the clients' presence keep-alive interval, or a
+	// still-connected client will be expired between its keep-alives. Yjs clients
+	// re-announce local presence roughly every 15s (half the y-protocols 30s
+	// outdated-timeout), and that re-announce — including for a peer attached to
+	// another cluster node, since awareness is relayed — refreshes the entry's
+	// last-update time here. The default suggested value 30s leaves ample margin;
+	// values at or below ~15s risk flapping live peers offline.
+	AwarenessExpiry time.Duration
+
+	// Has unexported fields.
+}
+    Server is a net/http-compatible WebSocket handler. Each distinct room name
+    maps to an independent Yjs document.
+
+func NewServer() *Server
+func NewServerWithPersistence(p PersistenceAdapter) *Server
+func (s *Server) Apply(ctx context.Context, room string, ...) error
+func (s *Server) AttachRelay(r cluster.Relay) error
+func (s *Server) BroadcastUpdate(ctx context.Context, room string, update []byte) error
+func (s *Server) CloseRoom(name string, force bool) error
+func (s *Server) GetAwareness(room string) (*awareness.Awareness, bool)
+func (s *Server) GetDoc(name string) *crdt.Doc
+func (s *Server) Inject(ctx context.Context, in cluster.Inbound) error
+func (s *Server) RelayStats() RelayStats
+func (s *Server) Rooms() []string
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request)
+func (s *Server) Shutdown(ctx context.Context) error

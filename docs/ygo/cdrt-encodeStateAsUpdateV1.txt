@@ -1,0 +1,6 @@
+package crdt // import "github.com/reearth/ygo/crdt"
+
+func EncodeStateAsUpdateV1(doc *Doc, sv StateVector) []byte
+    EncodeStateAsUpdateV1 encodes the part of doc newer than sv as a V1 binary
+    update. Pass nil to encode the entire document state.
+
