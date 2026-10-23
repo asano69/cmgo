@@ -1,20 +1,30 @@
 package filesync
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/asano69/cmgo/persistence"
 )
+
+const docID = "data.txt"
+
+var ctx = context.Background()
 
 type fakeDoc struct{ text string }
 
 func (d *fakeDoc) Text() string     { return d.text }
 func (d *fakeDoc) Replace(t string) { d.text = t }
 
-func newSyncer(t *testing.T) (*Syncer, *fakeDoc) {
+// newSyncer returns a Syncer over a file store, and the path of its file.
+func newSyncer(t *testing.T) (*Syncer, *fakeDoc, string) {
 	t.Helper()
+	dir := t.TempDir()
 	doc := &fakeDoc{}
-	return &Syncer{doc: doc, path: filepath.Join(t.TempDir(), "data.txt")}, doc
+	s := &Syncer{doc: doc, store: persistence.NewFileStore(dir), docID: docID}
+	return s, doc, filepath.Join(dir, docID)
 }
 
 func writeFile(t *testing.T, path, text string) {
@@ -35,14 +45,14 @@ func readFile(t *testing.T, path string) string {
 
 func mustSync(t *testing.T, s *Syncer) {
 	t.Helper()
-	if err := s.sync(); err != nil {
+	if err := s.sync(ctx); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestSyncLoadsExistingFile(t *testing.T) {
-	s, doc := newSyncer(t)
-	writeFile(t, s.path, "from file")
+	s, doc, path := newSyncer(t)
+	writeFile(t, path, "from file")
 	mustSync(t, s)
 	if doc.text != "from file" {
 		t.Errorf("buffer = %q, want %q", doc.text, "from file")
@@ -50,18 +60,18 @@ func TestSyncLoadsExistingFile(t *testing.T) {
 }
 
 func TestSyncSavesBuffer(t *testing.T) {
-	s, doc := newSyncer(t)
+	s, doc, path := newSyncer(t)
 	mustSync(t, s)
 	doc.text = "typed"
 	mustSync(t, s)
-	if got := readFile(t, s.path); got != "typed" {
+	if got := readFile(t, path); got != "typed" {
 		t.Errorf("file = %q, want %q", got, "typed")
 	}
 }
 
 // A keystroke right after a save must not be mistaken for an external edit.
 func TestSyncKeepsEditsMadeAfterSave(t *testing.T) {
-	s, doc := newSyncer(t)
+	s, doc, path := newSyncer(t)
 	doc.text = "a"
 	mustSync(t, s)
 	doc.text = "ab"
@@ -69,18 +79,18 @@ func TestSyncKeepsEditsMadeAfterSave(t *testing.T) {
 	if doc.text != "ab" {
 		t.Errorf("buffer = %q, want %q", doc.text, "ab")
 	}
-	if got := readFile(t, s.path); got != "ab" {
+	if got := readFile(t, path); got != "ab" {
 		t.Errorf("file = %q, want %q", got, "ab")
 	}
 }
 
 func TestSyncExternalEditWins(t *testing.T) {
-	s, doc := newSyncer(t)
+	s, doc, path := newSyncer(t)
 	doc.text = "buffer"
 	mustSync(t, s)
 
 	doc.text = "unsaved buffer edit"
-	writeFile(t, s.path, "external")
+	writeFile(t, path, "external")
 	mustSync(t, s)
 	if doc.text != "external" {
 		t.Errorf("buffer = %q, want %q", doc.text, "external")
@@ -88,26 +98,47 @@ func TestSyncExternalEditWins(t *testing.T) {
 }
 
 func TestSyncNormalizesLineEndingsWithoutRewriting(t *testing.T) {
-	s, doc := newSyncer(t)
-	writeFile(t, s.path, "a\r\nb")
+	s, doc, path := newSyncer(t)
+	writeFile(t, path, "a\r\nb")
 	mustSync(t, s)
 	if doc.text != "a\nb" {
 		t.Errorf("buffer = %q, want %q", doc.text, "a\nb")
 	}
-	if got := readFile(t, s.path); got != "a\r\nb" {
+	if got := readFile(t, path); got != "a\r\nb" {
 		t.Errorf("file was rewritten: %q", got)
 	}
 }
 
 func TestSyncRestoresDeletedFile(t *testing.T) {
-	s, doc := newSyncer(t)
+	s, doc, path := newSyncer(t)
 	doc.text = "keep me"
 	mustSync(t, s)
-	if err := os.Remove(s.path); err != nil {
+	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
 	mustSync(t, s)
-	if got := readFile(t, s.path); got != "keep me" {
+	if got := readFile(t, path); got != "keep me" {
 		t.Errorf("file = %q, want %q", got, "keep me")
+	}
+}
+
+// Any SnapshotStore works, not only files.
+func TestSyncWorksWithAnyStore(t *testing.T) {
+	store := persistence.NewMemoryStore()
+	doc := &fakeDoc{text: "buffer"}
+	s := &Syncer{doc: doc, store: store, docID: "doc"}
+	mustSync(t, s)
+
+	got, err := store.LoadSnapshot(ctx, "doc")
+	if err != nil || string(got) != "buffer" {
+		t.Fatalf("stored %q, %v; want %q", got, err, "buffer")
+	}
+
+	if err := store.SaveSnapshot(ctx, "doc", []byte("external")); err != nil {
+		t.Fatal(err)
+	}
+	mustSync(t, s)
+	if doc.text != "external" {
+		t.Errorf("buffer = %q, want %q", doc.text, "external")
 	}
 }
